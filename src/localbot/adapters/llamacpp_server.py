@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import shlex
-import sys
+
 from asyncio.subprocess import Process
 
 from localbot.config import cfg
@@ -25,6 +25,7 @@ class LlamaCppServer:
             "--port", str(cfg.llama_server_port),
             "--n-gpu-layers", str(cfg.llama_server_n_gpu_layers),
             "--ctx-size", str(cfg.llama_server_ctx_size),
+            "--chat-template", "llama3",  # Required for correct instruct formatting
         ]
         if cfg.llama_server_threads > 0:
             cmd += ["--threads", str(cfg.llama_server_threads)]

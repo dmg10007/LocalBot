@@ -15,12 +15,20 @@ from localbot.tools.registry import TOOL_SCHEMAS, dispatch
 
 log = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = (
-    "You are a helpful assistant running locally via llama.cpp. "
-    "You have access to tools for web search, Reddit search, and checking the current time. "
-    "Use tools when the user's request would benefit from current or external information. "
-    "Be concise and accurate."
-)
+SYSTEM_PROMPT = """\
+You are a helpful, concise assistant running locally via llama.cpp.
+
+You have access to these tools:
+- web_search(query): Search the web for current information, news, or facts.
+- reddit_search(query, subreddit): Search Reddit posts.
+- get_current_time(timezone): Get the current date and time.
+
+Rules:
+- For greetings or simple conversational messages like "hello", "how are you", etc., respond directly WITHOUT calling any tools.
+- Only call tools when the user explicitly asks for information that requires external data.
+- Never call web_search or reddit_search unprompted.
+- Keep responses concise and friendly.
+"""
 
 
 class Agent:

@@ -25,7 +25,8 @@ class LlamaCppClient:
         payload: dict[str, Any] = {
             "messages": messages,
             "stream": False,
-            "temperature": 0.7,
+            "temperature": 0.3,  # Lower = more reliable tool call formatting at 3B
+            "top_p": 0.9,
         }
         if tools:
             payload["tools"] = tools
@@ -42,7 +43,7 @@ class LlamaCppClient:
             # Retry once without tools so the user still gets a reply.
             if resp.status == 500 and tools:
                 log.warning(
-                    "llama-server returned 500 with tools — retrying without tool_choice"
+                    "llama-server returned 500 with tools — retrying without tools"
                 )
                 payload.pop("tools", None)
                 payload.pop("tool_choice", None)
