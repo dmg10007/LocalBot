@@ -14,8 +14,6 @@ A lightweight Discord DM bot that runs a local LLM via [llama.cpp](https://githu
 
 ## Prerequisites
 
-Before running LocalBot you need three things installed on your machine:
-
 ### 1. Python 3.11+
 
 ```bash
@@ -26,32 +24,50 @@ Download from [python.org](https://www.python.org/downloads/) if needed.
 
 ### 2. llama-server (llama.cpp)
 
-LocalBot delegates all inference to `llama-server`. You must build or install it separately.
+LocalBot delegates all inference to `llama-server`. The easiest way to get it on any platform is to download a pre-built binary from the official releases.
 
-**Option A — Build from source (recommended for GPU support):**
-```bash
-git clone https://github.com/ggerganov/llama.cpp
-cd llama.cpp
-cmake -B build -DLLAMA_CUDA=ON   # omit -DLLAMA_CUDA=ON for CPU-only
-cmake --build build --config Release -j$(nproc)
-# The binary will be at: build/bin/llama-server
+**Step 1 — Download a pre-built binary:**
+
+1. Go to the [llama.cpp releases page](https://github.com/ggerganov/llama.cpp/releases/latest)
+2. Download the zip that matches your platform:
+
+| Platform | File to download |
+|---|---|
+| Windows, CPU only | `llama-bXXXX-bin-win-cpu-x64.zip` |
+| Windows, NVIDIA GPU | `llama-bXXXX-bin-win-cuda-cu12.x-x64.zip` |
+| macOS (Apple Silicon) | `llama-bXXXX-bin-macos-arm64.zip` |
+| macOS (Intel) | `llama-bXXXX-bin-macos-x64.zip` |
+| Linux, CPU only | `llama-bXXXX-bin-ubuntu-x64.zip` |
+
+**Step 2 — Extract and note the path:**
+
+Extract the zip to a permanent location, e.g.:
+- Windows: `C:\llama\`
+- macOS/Linux: `~/llama/`
+
+Inside you'll find the `llama-server` (or `llama-server.exe` on Windows) binary.
+
+**Step 3 — Verify it works:**
+
+```powershell
+# Windows
+C:\llama\llama-server.exe --version
+
+# macOS / Linux
+~/llama/llama-server --version
 ```
 
-**Option B — Pre-built release:**  
-Download a pre-built binary for your platform from the [llama.cpp releases page](https://github.com/ggerganov/llama.cpp/releases) and place it somewhere on your `PATH`, or note the full path for the `.env` config.
+You don't need to add it to your PATH — you'll point LocalBot at it directly via the `LLAMA_SERVER_EXECUTABLE` setting in `.env`.
 
-Verify it works:
-```bash
-llama-server --version
-```
+> **Building from source:** Only needed if you want custom compile flags or cutting-edge commits. Requires CMake and a C++ compiler (Visual Studio Build Tools on Windows). See the [llama.cpp build docs](https://github.com/ggerganov/llama.cpp/blob/master/docs/build.md) for instructions.
 
 ### 3. A GGUF model file
 
 Download a quantized GGUF model. A few good starting points:
-- [Llama-3.2-3B-Instruct-Q4_K_M.gguf](https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF) — fast, CPU-friendly
+- [Llama-3.2-3B-Instruct-Q4_K_M.gguf](https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF) — fast, CPU-friendly (~2 GB)
 - [Mistral-7B-Instruct-v0.3-Q4_K_M.gguf](https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.3-GGUF) — stronger, needs ~6 GB RAM
 
-Note the full path to the file — you'll need it in `.env`.
+Note the full path to the downloaded file — you'll need it in `.env`.
 
 ### 4. A Discord Bot Token
 
@@ -99,7 +115,11 @@ pip install -e ".[pdf]"
 ### 4. Configure environment variables
 
 ```bash
+# macOS / Linux
 cp .env.example .env
+
+# Windows (PowerShell)
+Copy-Item .env.example .env
 ```
 
 Open `.env` and set at minimum:
@@ -108,18 +128,28 @@ Open `.env` and set at minimum:
 |---|---|---|
 | `DISCORD_BOT_TOKEN` | ✅ | Your bot token from the Developer Portal |
 | `LLAMA_SERVER_MODEL_PATH` | ✅ | Absolute path to your `.gguf` model file |
-| `LLAMA_SERVER_EXECUTABLE` | Only if not on PATH | Full path to `llama-server` binary |
+| `LLAMA_SERVER_EXECUTABLE` | ✅ | Full path to the `llama-server` binary |
 | `LLAMA_SERVER_N_GPU_LAYERS` | — | `0` = CPU only (default), `-1` = all layers on GPU |
 | `BRAVE_API_KEY` | — | Leave blank to disable web search |
+
+Example values on Windows:
+```env
+LLAMA_SERVER_EXECUTABLE=C:\llama\llama-server.exe
+LLAMA_SERVER_MODEL_PATH=C:\Users\Dalton\models\llama-3.2-3b-instruct-q4_k_m.gguf
+```
 
 All other settings have sensible defaults. See [`.env.example`](.env.example) for the full reference with descriptions.
 
 ### 5. Create required directories
 
-The bot needs `logs/` and `storage/` directories on first run. Create them manually until the auto-creation is implemented in `app.py`:
+The bot needs `logs/` and `storage/` directories on first run. Create them manually until auto-creation is implemented in `app.py`:
 
 ```bash
+# macOS / Linux
 mkdir -p logs storage
+
+# Windows (PowerShell)
+New-Item -ItemType Directory -Force -Path logs, storage
 ```
 
 ### 6. Run the bot
