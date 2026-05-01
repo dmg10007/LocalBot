@@ -15,6 +15,11 @@ from localbot.config import cfg
 
 log = logging.getLogger(__name__)
 
+# Llama 3 end-of-turn / end-of-sequence stop tokens.
+# Without these, the model can continue generating past its natural stop point
+# after receiving tool results, producing garbled or repeated output.
+_LLAMA3_STOP = ["<|eot_id|>", "<|end_of_text|>", "<|eom_id|>"]
+
 
 class LlamaCppClient:
     def __init__(self) -> None:
@@ -22,13 +27,11 @@ class LlamaCppClient:
         self._session: aiohttp.ClientSession | None = None
 
     def _get_session(self) -> aiohttp.ClientSession:
-        """Return the shared session, creating it on first call."""
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
         return self._session
 
     async def close(self) -> None:
-        """Close the shared session (called on bot shutdown)."""
         if self._session and not self._session.closed:
             await self._session.close()
             self._session = None
@@ -44,6 +47,8 @@ class LlamaCppClient:
             "stream": False,
             "temperature": 0.3,
             "top_p": 0.9,
+            "max_tokens": 1024,
+            "stop": _LLAMA3_STOP,
         }
         if tools:
             payload["tools"] = tools
@@ -56,8 +61,6 @@ class LlamaCppClient:
             timeout=aiohttp.ClientTimeout(total=cfg.model_timeout_seconds),
         )
 
-        # Some models return 500 when given tool schemas they don't support.
-        # Retry once without tools so the user still gets a reply.
         if resp.status == 500 and tools:
             log.warning("llama-server returned 500 with tools — retrying without tools")
             payload.pop("tools", None)
@@ -72,7 +75,6 @@ class LlamaCppClient:
         return await resp.json()  # type: ignore[no-any-return]
 
     async def wait_until_ready(self, retries: int = 20, delay: float = 1.5) -> None:
-        """Poll /health until llama-server is accepting requests."""
         session = self._get_session()
         for attempt in range(retries):
             try:
