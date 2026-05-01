@@ -1,0 +1,17 @@
+# This file is intentionally minimal.
+# Install the project and its dependencies with:
+#
+#   pip install -e .
+#
+# For development tools (ruff, mypy, pytest):
+#
+#   pip install -e ".[dev]"
+#
+# For optional PDF support:
+#
+#   pip install -e ".[pdf]"
+#
+# If you prefer a pinned lockfile, generate one with pip-tools:
+#
+#   pip install pip-tools
+#   pip-compile pyproject.toml -o requirements.lock

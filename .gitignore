@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# Virtualenv
+.venv/
+venv/
+env/
+
+# Environment / secrets
+.env
+*.env
+
+# Logs
+logs/
+*.log
+logs/*.jsonl
+
+# Storage
+storage/
+*.sqlite3
+*.sqlite
+
+# Tokens / credentials
+tokens/
+credentials/
+
+# Workspace files
+workspace/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+*.swp
