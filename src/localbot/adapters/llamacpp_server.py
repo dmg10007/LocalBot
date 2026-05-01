@@ -18,6 +18,9 @@ class LlamaCppServer:
 
     async def start(self) -> None:
         """Launch llama-server as a subprocess."""
+        # NOTE: Do NOT pass --chat-template here. The GGUF file embeds the
+        # correct template for the model. Overriding it causes control tokens
+        # like <|eot_id|> to leak into responses as literal text (e.g. 'd\n').
         cmd = [
             cfg.llama_server_executable,
             "--model", cfg.llama_server_model_path,
@@ -25,10 +28,11 @@ class LlamaCppServer:
             "--port", str(cfg.llama_server_port),
             "--n-gpu-layers", str(cfg.llama_server_n_gpu_layers),
             "--ctx-size", str(cfg.llama_server_ctx_size),
-            "--chat-template", "llama3",  # Required for correct instruct formatting
         ]
         if cfg.llama_server_threads > 0:
             cmd += ["--threads", str(cfg.llama_server_threads)]
+        # LLAMA_SERVER_EXTRA_ARGS in .env is the escape hatch for any extra
+        # llama-server flags (e.g. --flash-attn, --no-mmap, --parallel).
         if cfg.llama_server_extra_args:
             cmd += shlex.split(cfg.llama_server_extra_args)
 
@@ -38,7 +42,6 @@ class LlamaCppServer:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
-        # Give server time to bind
         await asyncio.sleep(3)
         log.info("llama-server started (pid=%s)", self._proc.pid)
 
