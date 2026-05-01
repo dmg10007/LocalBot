@@ -15,12 +15,20 @@ from localbot.tools.registry import TOOL_SCHEMAS, dispatch
 
 log = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = (
-    "You are a helpful assistant running locally via llama.cpp. "
-    "You have access to tools for web search, Reddit search, and checking the current time. "
-    "Use tools when the user's request would benefit from current or external information. "
-    "Be concise and accurate."
-)
+SYSTEM_PROMPT = """\
+You are a helpful, concise assistant running locally via llama.cpp.
+
+You have access to these tools:
+- web_search(query): Search the web for current information, news, or facts.
+- reddit_search(query, subreddit): Search Reddit posts.
+- get_current_time(timezone): Get the current date and time.
+
+Rules:
+- For greetings or simple conversational messages like "hello", "hi", "how are you", respond directly WITHOUT calling any tools. Just say hello back.
+- Only call tools when the user EXPLICITLY asks for information that requires external data (e.g. "search for...", "what's the news on...", "what time is it").
+- Never call web_search or reddit_search unprompted or just because you know the date.
+- Keep responses concise and friendly.
+"""
 
 
 class Agent:
@@ -33,6 +41,7 @@ class Agent:
         await self._server.ensure_running()
         await self._client.wait_until_ready(retries=10, delay=1.0)
 
+        # Only load clean text turns (no tool call intermediates)
         history = get_history(user_id)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -40,6 +49,7 @@ class Agent:
             {"role": "user", "content": user_message},
         ]
 
+        # Save the user message to history immediately
         append_message(user_id, "user", user_message)
         log_event("user_message", user_id=user_id, content=user_message)
 
@@ -49,11 +59,16 @@ class Agent:
         except asyncio.TimeoutError:
             reply = "Sorry, your request took too long and was cancelled."
 
-        append_message(user_id, "assistant", reply)
+        # Only persist the final plain-text assistant reply, never tool-call intermediates
+        if reply:
+            append_message(user_id, "assistant", reply)
         log_event("assistant_reply", user_id=user_id, content=reply)
         return reply
 
     async def _run_loop(self, messages: list[dict[str, Any]]) -> str:
+        """Run the tool loop. messages is a local copy — tool-call turns are
+        added here for context within this request but are never written to
+        the persistent history store."""
         for iteration in range(cfg.max_tool_iterations + 1):
             response = await self._client.chat(messages, tools=TOOL_SCHEMAS)
             choice = response["choices"][0]
@@ -64,16 +79,16 @@ class Agent:
                 return msg.get("content") or ""
 
             if iteration == cfg.max_tool_iterations:
-                # Exceeded iteration budget — force a plain reply
+                # Exceeded iteration budget — force a plain reply without tools
                 messages.append({"role": "assistant", "content": None, "tool_calls": msg["tool_calls"]})
                 messages.append({
                     "role": "user",
-                    "content": "Please provide your final answer based on the information gathered.",
+                    "content": "Please provide your final answer based on the information gathered so far.",
                 })
                 final = await self._client.chat(messages, tools=None)
                 return final["choices"][0]["message"].get("content") or ""
 
-            # Execute all tool calls
+            # Execute all tool calls and append results to the local message list only
             messages.append(msg)
             for tc in msg["tool_calls"]:
                 fn = tc["function"]
