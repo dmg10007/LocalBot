@@ -10,13 +10,18 @@ from localbot.tools import search, reddit, time_tools
 
 log = logging.getLogger(__name__)
 
-# OpenAI-style tool schemas sent to the model
+# OpenAI-style tool schemas sent to the model.
+# Descriptions are intentionally narrow — small models over-call tools
+# when descriptions are broad. "Use for X" should mean "only use for X".
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
             "name": "web_search",
-            "description": "Search the web using Brave Search. Use for current events, facts, or anything that may have changed recently.",
+            "description": (
+                "Search the web. Only call this when the user explicitly asks to "
+                "search, look something up, or requests current news or facts."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -30,12 +35,18 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "reddit_search",
-            "description": "Search Reddit posts and comments.",
+            "description": (
+                "Search Reddit posts. Only call this when the user explicitly asks "
+                "to search Reddit or find Reddit discussions on a topic."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Search query"},
-                    "subreddit": {"type": "string", "description": "Optional subreddit to search within"},
+                    "subreddit": {
+                        "type": "string",
+                        "description": "Subreddit name without r/ prefix, e.g. 'worldnews'",
+                    },
                 },
                 "required": ["query"],
             },
@@ -45,11 +56,17 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "get_current_time",
-            "description": "Get the current date and time in a given timezone.",
+            "description": (
+                "Get the current date and time. Only call this when the user "
+                "explicitly asks for the time or date."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "timezone": {"type": "string", "description": "IANA timezone name, e.g. America/New_York"}
+                    "timezone": {
+                        "type": "string",
+                        "description": "IANA timezone name, e.g. America/New_York. Defaults to UTC.",
+                    }
                 },
                 "required": [],
             },

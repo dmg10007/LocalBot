@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Any
 
 from localbot.adapters.llamacpp_client import LlamaCppClient
@@ -18,17 +19,25 @@ log = logging.getLogger(__name__)
 SYSTEM_PROMPT = """\
 You are a helpful, concise assistant running locally via llama.cpp.
 
-You have access to these tools:
-- web_search(query): Search the web for current information, news, or facts.
-- reddit_search(query, subreddit): Search Reddit posts.
-- get_current_time(timezone): Get the current date and time.
-
-Rules:
-- For greetings or simple conversational messages like "hello", "hi", "how are you", respond directly WITHOUT calling any tools. Just say hello back.
-- Only call tools when the user EXPLICITLY asks for information that requires external data (e.g. "search for...", "what's the news on...", "what time is it").
-- Never call web_search or reddit_search unprompted or just because you know the date.
-- Keep responses concise and friendly.
+You have access to tools for web search, Reddit search, and getting the current time.
+Only call tools when the user EXPLICITLY asks for information that requires them.
+For greetings, casual chat, or anything conversational — respond directly without calling any tools.
+Keep responses concise and friendly.
 """
+
+# Patterns that should NEVER trigger tool calls — bypass schemas entirely.
+_CONVERSATIONAL = re.compile(
+    r"^(hi+|hello+|hey+|howdy|sup|what'?s up|how are you|how r u|"
+    r"good (morning|evening|afternoon|night)|thanks?( you)?|thank you|"
+    r"ok(ay)?|sure|cool|great|nice|awesome|sounds good|got it|"
+    r"bye|goodbye|see ya|later|lol|haha|yes|no|yep|nope|:\.?[)|(|D])\.?\!?$",
+    re.IGNORECASE,
+)
+
+
+def _needs_tools(message: str) -> bool:
+    """Return False for clearly conversational messages so we skip schema injection."""
+    return not bool(_CONVERSATIONAL.match(message.strip()))
 
 
 class Agent:
@@ -41,7 +50,6 @@ class Agent:
         await self._server.ensure_running()
         await self._client.wait_until_ready(retries=10, delay=1.0)
 
-        # Only load clean text turns (no tool call intermediates)
         history = get_history(user_id)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -49,37 +57,35 @@ class Agent:
             {"role": "user", "content": user_message},
         ]
 
-        # Save the user message to history immediately
-        append_message(user_id, "user", user_message)
         log_event("user_message", user_id=user_id, content=user_message)
 
         try:
             async with asyncio.timeout(cfg.request_deadline_seconds):
-                reply = await self._run_loop(messages)
+                tools = TOOL_SCHEMAS if _needs_tools(user_message) else None
+                reply = await self._run_loop(messages, tools)
         except asyncio.TimeoutError:
             reply = "Sorry, your request took too long and was cancelled."
 
-        # Only persist the final plain-text assistant reply, never tool-call intermediates
+        # Persist both turns only after a successful reply to avoid orphaned messages.
         if reply:
+            append_message(user_id, "user", user_message)
             append_message(user_id, "assistant", reply)
         log_event("assistant_reply", user_id=user_id, content=reply)
         return reply
 
-    async def _run_loop(self, messages: list[dict[str, Any]]) -> str:
-        """Run the tool loop. messages is a local copy — tool-call turns are
-        added here for context within this request but are never written to
-        the persistent history store."""
+    async def _run_loop(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None
+    ) -> str:
+        """Tool loop. messages is local-only — tool turns are never written to history."""
         for iteration in range(cfg.max_tool_iterations + 1):
-            response = await self._client.chat(messages, tools=TOOL_SCHEMAS)
+            response = await self._client.chat(messages, tools=tools)
             choice = response["choices"][0]
             msg = choice["message"]
 
-            # No tool call — return the final text
             if not msg.get("tool_calls"):
                 return msg.get("content") or ""
 
             if iteration == cfg.max_tool_iterations:
-                # Exceeded iteration budget — force a plain reply without tools
                 messages.append({"role": "assistant", "content": None, "tool_calls": msg["tool_calls"]})
                 messages.append({
                     "role": "user",
@@ -88,7 +94,6 @@ class Agent:
                 final = await self._client.chat(messages, tools=None)
                 return final["choices"][0]["message"].get("content") or ""
 
-            # Execute all tool calls and append results to the local message list only
             messages.append(msg)
             for tc in msg["tool_calls"]:
                 fn = tc["function"]

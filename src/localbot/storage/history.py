@@ -13,7 +13,9 @@ class Message(TypedDict):
 
 
 def _con() -> sqlite3.Connection:
-    return sqlite3.connect(cfg.database_path)
+    con = sqlite3.connect(cfg.database_path)
+    con.execute("PRAGMA journal_mode=WAL")
+    return con
 
 
 def get_history(user_id: str) -> list[Message]:
@@ -24,7 +26,6 @@ def get_history(user_id: str) -> list[Message]:
         (user_id, cfg.max_history_messages),
     ).fetchall()
     con.close()
-    # Return in chronological order
     return [{"role": r, "content": c} for r, c in reversed(rows)]
 
 
@@ -35,7 +36,7 @@ def append_message(user_id: str, role: str, content: str) -> None:
             "INSERT INTO history (user_id, role, content) VALUES (?, ?, ?)",
             (user_id, role, content),
         )
-        # Trim to max
+        # Trim oldest rows beyond the cap using the index on (user_id, ts DESC)
         con.execute(
             "DELETE FROM history WHERE user_id = ? AND id NOT IN "
             "(SELECT id FROM history WHERE user_id = ? ORDER BY ts DESC LIMIT ?)",
