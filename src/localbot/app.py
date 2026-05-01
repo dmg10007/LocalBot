@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 
 import discord
@@ -32,6 +31,7 @@ class LocalBot(discord.Client):
         self._client = LlamaCppClient()
         self._agent = Agent(self._server, self._client)
         self._scheduler = SchedulerService(self._send_scheduled)
+        self._backend_ready = False
 
     # ------------------------------------------------------------------
     # Discord events
@@ -39,12 +39,21 @@ class LocalBot(discord.Client):
 
     async def on_ready(self) -> None:
         log.info("Logged in as %s (id=%s)", self.user, self.user.id if self.user else "?")
-        await self._server.start()
-        await self._client.wait_until_ready()
-        self._scheduler.start()
+        # Start backend in a background task so Discord events aren't blocked
+        # during the ~30 s llama-server warmup.
+        asyncio.create_task(self._start_backend())
+
+    async def _start_backend(self) -> None:
+        try:
+            await self._server.start()
+            await self._client.wait_until_ready()
+            self._scheduler.start()
+            self._backend_ready = True
+            log.info("Backend ready")
+        except Exception:
+            log.exception("Backend startup failed")
 
     async def on_message(self, message: discord.Message) -> None:
-        # Ignore bots and non-DM messages
         if message.author.bot:
             return
         if not isinstance(message.channel, discord.DMChannel):
@@ -53,11 +62,13 @@ class LocalBot(discord.Client):
         user_id = str(message.author.id)
         text = message.content.strip()
 
-        # Handle built-in commands first
         if await self._handle_command(message, user_id, text):
             return
 
-        # Otherwise run through the agent
+        if not self._backend_ready:
+            await message.channel.send("Still starting up — please try again in a moment.")
+            return
+
         async with message.channel.typing():
             reply = await self._agent.handle(user_id, text)
 
@@ -66,6 +77,7 @@ class LocalBot(discord.Client):
 
     async def close(self) -> None:
         self._scheduler.stop()
+        await self._client.close()
         await self._server.stop()
         await super().close()
 
@@ -77,7 +89,6 @@ class LocalBot(discord.Client):
         """Return True if the message was a built-in command."""
         lower = text.lower()
 
-        # jobs list
         if lower == "jobs list":
             jobs = self._scheduler.list_user_jobs(user_id)
             if not jobs:
@@ -87,8 +98,8 @@ class LocalBot(discord.Client):
                 await message.channel.send("**Your scheduled jobs:**\n" + "\n".join(lines))
             return True
 
-        # jobs cancel <id>
-        m = re.match(r"^jobs cancel ([a-z0-9]+)$", lower)
+        # jobs cancel <id> — match on original text, case-insensitive, flexible ID format
+        m = re.match(r"^jobs cancel ([a-zA-Z0-9_-]+)$", text, re.IGNORECASE)
         if m:
             cancelled = self._scheduler.cancel_job(m.group(1))
             await message.channel.send(
@@ -96,7 +107,6 @@ class LocalBot(discord.Client):
             )
             return True
 
-        # timezone set <tz>
         m = re.match(r"^timezone set (.+)$", text, re.IGNORECASE)
         if m:
             tz = m.group(1).strip()
@@ -104,25 +114,21 @@ class LocalBot(discord.Client):
             await message.channel.send(f"Timezone set to `{tz}`.")
             return True
 
-        # timezone show
         if lower == "timezone show":
             tz = get_user_timezone(user_id)
             await message.channel.send(f"Your timezone is `{tz}`.")
             return True
 
-        # time now
         if lower == "time now":
             tz = get_user_timezone(user_id)
             await message.channel.send(get_current_time(tz))
             return True
 
-        # clear history
         if lower in ("clear", "clear history", "/clear"):
             clear_history(user_id)
             await message.channel.send("Conversation history cleared.")
             return True
 
-        # help
         if lower in ("help", "/help"):
             await message.channel.send(
                 "**LocalBot commands**\n"
@@ -144,15 +150,16 @@ class LocalBot(discord.Client):
     # ------------------------------------------------------------------
 
     async def _send_scheduled(self, user_id: str, prompt: str) -> None:
-        """Called by the scheduler to deliver a scheduled prompt to a user."""
+        """Called by the scheduler to deliver a prompt to a user via DM."""
         try:
-            user = await self.fetch_user(int(user_id))
-            dm = await user.create_dm()
-            reply = await self._agent.handle(user_id, prompt)
+            discord_user = await self.fetch_user(int(user_id))
+            dm = await discord_user.create_dm()
+            async with dm.typing():
+                reply = await self._agent.handle(user_id, prompt)
             for chunk in split_message(reply):
                 await dm.send(chunk)
-        except Exception as exc:
-            log.error("Failed to send scheduled message to %s: %s", user_id, exc)
+        except Exception:
+            log.exception("Failed to deliver scheduled message to user %s", user_id)
 
 
 def main() -> None:
@@ -160,12 +167,6 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-
-    if not cfg.discord_bot_token:
-        raise SystemExit("DISCORD_BOT_TOKEN is not set in .env")
-    if not cfg.llama_server_model_path:
-        raise SystemExit("LLAMA_SERVER_MODEL_PATH is not set in .env")
-
     init_db()
     bot = LocalBot()
     bot.run(cfg.discord_bot_token)

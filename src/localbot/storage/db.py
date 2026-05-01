@@ -8,13 +8,15 @@ from localbot.config import cfg
 
 
 def init_db() -> None:
-    """Create tables and required directories if they don't exist."""
+    """Create tables, indexes, and required directories if they don't exist."""
     os.makedirs(os.path.dirname(cfg.database_path) or "storage", exist_ok=True)
     os.makedirs(os.path.dirname(cfg.audit_log_path) or "logs", exist_ok=True)
 
     con = sqlite3.connect(cfg.database_path)
     with con:
         con.executescript("""
+            PRAGMA journal_mode=WAL;
+
             CREATE TABLE IF NOT EXISTS history (
                 id        INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id   TEXT    NOT NULL,
@@ -22,6 +24,10 @@ def init_db() -> None:
                 content   TEXT    NOT NULL,
                 ts        REAL    NOT NULL DEFAULT (unixepoch('now'))
             );
+
+            -- Index for fast per-user history lookups and trim queries
+            CREATE INDEX IF NOT EXISTS idx_history_user_ts
+                ON history(user_id, ts DESC);
 
             CREATE TABLE IF NOT EXISTS user_settings (
                 user_id   TEXT PRIMARY KEY,

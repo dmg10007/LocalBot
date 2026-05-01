@@ -17,7 +17,6 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-# Callback type: receives (user_id, prompt) and sends the reply
 SendCallback = Callable[[str, str], Awaitable[None]]
 
 
@@ -28,40 +27,51 @@ class SchedulerService:
 
     def start(self) -> None:
         self._scheduler.start()
-        # Re-register persisted jobs on startup
-        for job in all_jobs():
+        persisted = all_jobs()  # single DB call
+        for job in persisted:
             self._register(job)
-        log.info("Scheduler started with %d persisted jobs", len(all_jobs()))
+        log.info("Scheduler started with %d persisted jobs", len(persisted))
 
     def stop(self) -> None:
-        self._scheduler.shutdown(wait=False)
+        if self._scheduler.running:
+            self._scheduler.shutdown(wait=False)
+        log.info("Scheduler stopped")
 
     def _register(self, job: Job) -> None:
-        async def _run() -> None:
-            await self._send(job.user_id, job.prompt)
+        parts = job.cron_expr.split()
+        if len(parts) != 5:
+            log.warning("Invalid cron expression for job %s: %r", job.job_id, job.cron_expr)
+            return
+        minute, hour, day, month, day_of_week = parts
+        self._scheduler.add_job(
+            self._fire,
+            CronTrigger(
+                minute=minute, hour=hour, day=day,
+                month=month, day_of_week=day_of_week,
+            ),
+            args=[job.user_id, job.prompt],
+            id=job.job_id,
+            replace_existing=True,
+        )
 
-        try:
-            trigger = CronTrigger.from_crontab(job.cron_expr)
-            self._scheduler.add_job(
-                _run,
-                trigger=trigger,
-                id=job.job_id,
-                replace_existing=True,
-                max_instances=1,
-            )
-        except Exception as exc:
-            log.error("Failed to register job %s: %s", job.job_id, exc)
+    async def _fire(self, user_id: str, prompt: str) -> None:
+        await self._send(user_id, prompt)
 
     def add_job(self, user_id: str, prompt: str, cron_expr: str) -> Job:
+        total = len(all_jobs())
+        user_total = len(list_jobs(user_id))
+        if total >= cfg.scheduler_max_jobs:
+            raise ValueError("Global job limit reached.")
+        if user_total >= cfg.scheduler_max_jobs_per_user:
+            raise ValueError("Per-user job limit reached.")
         job = Job(
-            job_id=str(uuid.uuid4())[:8],
+            job_id=uuid.uuid4().hex[:8],
             user_id=user_id,
             prompt=prompt,
             cron_expr=cron_expr,
         )
         save_job(job)
         self._register(job)
-        log.info("Scheduled job %s for user %s: %s", job.job_id, user_id, cron_expr)
         return job
 
     def cancel_job(self, job_id: str) -> bool:
@@ -69,11 +79,7 @@ class SchedulerService:
             self._scheduler.remove_job(job_id)
         except Exception:
             pass
-        delete_job(job_id)
-        return True
+        return delete_job(job_id)
 
     def list_user_jobs(self, user_id: str) -> list[Job]:
         return list_jobs(user_id)
-
-    def job_count_for_user(self, user_id: str) -> int:
-        return len(list_jobs(user_id))
