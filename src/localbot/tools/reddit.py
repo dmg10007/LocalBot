@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 
 import aiohttp
 
@@ -10,10 +11,16 @@ from localbot.config import cfg
 log = logging.getLogger(__name__)
 
 
+def _clean_subreddit(subreddit: str) -> str:
+    """Strip leading r/ or /r/ if the model included it."""
+    return re.sub(r"^/?r/", "", subreddit.strip())
+
+
 async def reddit_search(query: str, subreddit: str | None = None) -> str:
     if subreddit:
+        subreddit = _clean_subreddit(subreddit)
         url = f"https://www.reddit.com/r/{subreddit}/search.json"
-        params = {"q": query, "restrict_sr": "1", "sort": "relevance", "limit": cfg.search_result_count}
+        params: dict = {"q": query, "restrict_sr": "1", "sort": "relevance", "limit": cfg.search_result_count}
     else:
         url = "https://www.reddit.com/search.json"
         params = {"q": query, "sort": "relevance", "limit": cfg.search_result_count}
