@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "localbot"
+version = "0.1.0"
+description = "Lightweight local LLM Discord bot powered by llama.cpp"
+requires-python = ">=3.11"
+dependencies = [
+    "discord.py>=2.4",
+    "aiohttp>=3.9",
+    "python-dotenv>=1.0",
+    "apscheduler>=3.10",
+]
+
+[project.scripts]
+localbot = "localbot.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

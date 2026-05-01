@@ -1,0 +1,11 @@
+# Core
+discord.py>=2.4
+aiohttp>=3.9
+python-dotenv>=1.0
+apscheduler>=3.10
+
+# Optional: PDF attachment support
+# pypdf>=4.0
+
+# Optional: Reddit search (unauthenticated JSON API used by default)
+# No extra package required.
