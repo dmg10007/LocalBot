@@ -22,7 +22,7 @@ env/
 # Logs
 logs/
 *.log
-*.jsonl
+logs/*.jsonl
 
 # Storage
 storage/

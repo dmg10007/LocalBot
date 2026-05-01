@@ -17,13 +17,18 @@ A lightweight Discord DM bot that runs a local LLM via [llama.cpp](https://githu
 git clone https://github.com/dmg10007/LocalBot.git
 cd LocalBot
 python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
 
-# 2. Configure
+# 2. Install
+pip install -e .          # runtime only
+pip install -e ".[dev]"   # + ruff, mypy, pytest
+
+# 3. Configure
 cp .env.example .env
 # Edit .env — set DISCORD_BOT_TOKEN and LLAMA_SERVER_MODEL_PATH at minimum
 
-# 3. Run
+# 4. Run
+localbot
+# or equivalently:
 python -m localbot
 ```
 
@@ -31,8 +36,11 @@ llama-server is started automatically on bot startup. Make sure `llama-server` i
 
 ## Project Layout
 
+> **Note:** The source tree below is the planned layout. Implementation is in progress on the `dev` branch.
+
 ```
 src/localbot/
+├── __main__.py       # `python -m localbot` entry point
 ├── app.py            # Entry point & Discord event loop
 ├── config.py         # Settings loaded from .env
 ├── agent.py          # Core request/tool loop
