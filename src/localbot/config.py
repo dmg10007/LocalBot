@@ -47,6 +47,23 @@ class Config:
     scheduler_max_jobs: int = field(default_factory=lambda: _get_int("SCHEDULER_MAX_JOBS", 20))
     scheduler_max_jobs_per_user: int = field(default_factory=lambda: _get_int("SCHEDULER_MAX_JOBS_PER_USER", 5))
 
+    # Rate limiting: minimum seconds between LLM requests per user.
+    rate_limit_seconds: int = field(default_factory=lambda: _get_int("RATE_LIMIT_SECONDS", 5))
+    # Maximum accepted input message length (characters).
+    max_input_length: int = field(default_factory=lambda: _get_int("MAX_INPUT_LENGTH", 1000))
+
+    def __post_init__(self) -> None:
+        missing = []
+        if not self.discord_bot_token:
+            missing.append("DISCORD_BOT_TOKEN")
+        if not self.llama_server_model_path:
+            missing.append("LLAMA_SERVER_MODEL_PATH")
+        if missing:
+            raise ValueError(
+                f"Missing required environment variables: {', '.join(missing)}. "
+                "Copy .env.example to .env and fill in the required values."
+            )
+
 
 # Module-level singleton
 cfg = Config()

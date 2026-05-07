@@ -27,17 +27,20 @@ Never call the same tool with the same arguments twice in one conversation turn.
 Keep responses concise and friendly.
 """
 
+# Use fullmatch so the entire message must match — not just a prefix.
 _CONVERSATIONAL = re.compile(
-    r"^(hi+|hello+|hey+|howdy|sup|what'?s up|how are you|how r u|"
+    r"(hi+|hello+|hey+|howdy|sup|what'?s up|how are you|how r u|"
     r"good (morning|evening|afternoon|night)|thanks?( you)?|thank you|"
     r"ok(ay)?|sure|cool|great|nice|awesome|sounds good|got it|"
-    r"bye|goodbye|see ya|later|lol|haha|yes|no|yep|nope|:\.?[)|(|D])\.?\!?$",
+    r"bye|goodbye|see ya|later|lol|haha|yes|no|yep|nope|:\.?[)|(|D])\.?\!?",
     re.IGNORECASE,
 )
 
 
 def _needs_tools(message: str) -> bool:
-    return not bool(_CONVERSATIONAL.match(message.strip()))
+    # fullmatch ensures the whole (stripped) message is conversational,
+    # not just a conversational prefix followed by a real request.
+    return not bool(_CONVERSATIONAL.fullmatch(message.strip()))
 
 
 class Agent:

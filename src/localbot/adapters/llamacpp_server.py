@@ -33,6 +33,8 @@ class LlamaCppServer:
             cmd += ["--threads", str(cfg.llama_server_threads)]
         # LLAMA_SERVER_EXTRA_ARGS in .env is the escape hatch for any extra
         # llama-server flags (e.g. --flash-attn, --no-mmap, --parallel).
+        # WARNING: This value must be trusted — it is parsed and passed directly
+        # to the subprocess. Never allow user input to influence this setting.
         if cfg.llama_server_extra_args:
             cmd += shlex.split(cfg.llama_server_extra_args)
 
@@ -42,8 +44,9 @@ class LlamaCppServer:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
-        await asyncio.sleep(3)
-        log.info("llama-server started (pid=%s)", self._proc.pid)
+        # No sleep here — wait_until_ready() polls /health and returns as soon
+        # as the server is accepting connections, avoiding unnecessary delay.
+        log.info("llama-server process started (pid=%s), waiting for readiness...", self._proc.pid)
 
     async def stop(self) -> None:
         if self._proc and self._proc.returncode is None:

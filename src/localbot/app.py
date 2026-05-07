@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
+from collections import defaultdict
 
 import discord
 
@@ -32,6 +34,8 @@ class LocalBot(discord.Client):
         self._agent = Agent(self._server, self._client)
         self._scheduler = SchedulerService(self._send_scheduled)
         self._backend_ready = False
+        # Per-user rate limiting: tracks last LLM request timestamp.
+        self._last_request: dict[str, float] = defaultdict(float)
 
     # ------------------------------------------------------------------
     # Discord events
@@ -68,6 +72,23 @@ class LocalBot(discord.Client):
         if not self._backend_ready:
             await message.channel.send("Still starting up — please try again in a moment.")
             return
+
+        # Input length cap — reject oversized messages before they reach the LLM.
+        if len(text) > cfg.max_input_length:
+            await message.channel.send(
+                f"Your message is too long (max {cfg.max_input_length} characters). Please shorten it."
+            )
+            return
+
+        # Per-user rate limiting — prevent request flooding.
+        now = time.monotonic()
+        if now - self._last_request[user_id] < cfg.rate_limit_seconds:
+            remaining = cfg.rate_limit_seconds - (now - self._last_request[user_id])
+            await message.channel.send(
+                f"Please wait {remaining:.1f}s before sending another message."
+            )
+            return
+        self._last_request[user_id] = now
 
         async with message.channel.typing():
             reply = await self._agent.handle(user_id, text)

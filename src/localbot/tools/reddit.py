@@ -10,6 +10,25 @@ from localbot.config import cfg
 
 log = logging.getLogger(__name__)
 
+# Module-level session reused across calls to avoid per-request TCP overhead.
+# aiohttp explicitly recommends against creating a new session per request.
+_session: aiohttp.ClientSession | None = None
+
+
+def _get_session() -> aiohttp.ClientSession:
+    global _session
+    if _session is None or _session.closed:
+        _session = aiohttp.ClientSession()
+    return _session
+
+
+async def close_session() -> None:
+    """Close the shared session. Call this on bot shutdown."""
+    global _session
+    if _session and not _session.closed:
+        await _session.close()
+        _session = None
+
 
 def _clean_subreddit(subreddit: str) -> str:
     """Strip leading r/ or /r/ if the model included it."""
@@ -26,15 +45,15 @@ async def reddit_search(query: str, subreddit: str | None = None) -> str:
         params = {"q": query, "sort": "relevance", "limit": cfg.search_result_count}
 
     headers = {"User-Agent": "LocalBot/0.1"}
-    async with aiohttp.ClientSession() as session:
-        async with session.get(
-            url,
-            params=params,
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=cfg.tool_timeout_seconds),
-        ) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
+    session = _get_session()
+    async with session.get(
+        url,
+        params=params,
+        headers=headers,
+        timeout=aiohttp.ClientTimeout(total=cfg.tool_timeout_seconds),
+    ) as resp:
+        resp.raise_for_status()
+        data = await resp.json()
 
     posts = data.get("data", {}).get("children", [])
     if not posts:
@@ -46,6 +65,6 @@ async def reddit_search(query: str, subreddit: str | None = None) -> str:
         lines.append(
             f"{i}. **{d.get('title', '')}** (r/{d.get('subreddit', '')})\n"
             f"   https://reddit.com{d.get('permalink', '')}\n"
-            f"   ⬆ {d.get('score', 0)} | {d.get('num_comments', 0)} comments"
+            f"   \u2b06 {d.get('score', 0)} | {d.get('num_comments', 0)} comments"
         )
     return "\n\n".join(lines)
