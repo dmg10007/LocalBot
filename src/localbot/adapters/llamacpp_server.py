@@ -20,7 +20,7 @@ class LlamaCppServer:
         """Launch llama-server as a subprocess."""
         # NOTE: Do NOT pass --chat-template here. The GGUF file embeds the
         # correct template for the model. Overriding it causes control tokens
-        # like <|eot_id|> to leak into responses as literal text (e.g. 'd\n').
+        # like <|eot_id|> to leak into responses as literal text.
         cmd = [
             cfg.llama_server_executable,
             "--model", cfg.llama_server_model_path,
@@ -31,10 +31,10 @@ class LlamaCppServer:
         ]
         if cfg.llama_server_threads > 0:
             cmd += ["--threads", str(cfg.llama_server_threads)]
-        # LLAMA_SERVER_EXTRA_ARGS in .env is the escape hatch for any extra
-        # llama-server flags (e.g. --flash-attn, --no-mmap, --parallel).
-        # WARNING: This value must be trusted — it is parsed and passed directly
-        # to the subprocess. Never allow user input to influence this setting.
+        # LLAMA_SERVER_EXTRA_ARGS is the escape hatch for extra llama-server
+        # flags (e.g. --flash-attn, --no-mmap, --parallel, --reasoning-budget).
+        # WARNING: This value must be trusted — never allow user input to
+        # influence this setting as it is passed directly to the subprocess.
         if cfg.llama_server_extra_args:
             cmd += shlex.split(cfg.llama_server_extra_args)
 
