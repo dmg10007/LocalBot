@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any
 
 import aiohttp
@@ -15,10 +16,52 @@ from localbot.config import cfg
 
 log = logging.getLogger(__name__)
 
-# Llama 3 end-of-turn / end-of-sequence stop tokens.
-# Without these, the model can continue generating past its natural stop point
-# after receiving tool results, producing garbled or repeated output.
-_LLAMA3_STOP = ["<|eot_id|>", "<|end_of_text|>", "<|eom_id|>"]
+# Gemma / GLM-style stop tokens used by this thinking model.
+_STOP_TOKENS = [
+    "<end_of_turn>",   # Gemma native EOS
+    "<|eot_id|>",      # Llama 3 (kept as fallback)
+    "<|end_of_text|>",
+    "<|eom_id|>",
+]
+
+# Matches a full <think>...</think> block, including newlines.
+# Also handles the GLM edge-case where the opening tag is injected by the
+# chat template and omitted from the model output (only </think> is present).
+_THINK_RE = re.compile(
+    r"(?:<think>)?.*?</think>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def strip_thinking(message: dict[str, Any]) -> str:
+    """Extract the user-facing reply from a chat completion message dict.
+
+    llama.cpp surfaces thinking-model output in one of two ways:
+      1. A separate ``reasoning_content`` field (preferred — already split).
+      2. Inside ``content`` as a ``<think>...</think>`` block before the reply.
+
+    In both cases the thinking text is discarded and only the final answer
+    is returned. The raw thinking block is logged at DEBUG level.
+    """
+    # Case 1: llama.cpp already separated the reasoning into its own field.
+    reasoning = message.get("reasoning_content") or ""
+    content = message.get("content") or ""
+
+    if reasoning:
+        log.debug("[thinking] %s", reasoning[:500])
+        return content.strip()
+
+    # Case 2: thinking block is embedded in content.
+    if "</think>" in content:
+        # Capture everything up to and including the closing tag for logging.
+        think_match = _THINK_RE.match(content.lstrip())
+        if think_match:
+            log.debug("[thinking] %s", think_match.group(0)[:500])
+
+        clean = _THINK_RE.sub("", content).strip()
+        return clean
+
+    return content.strip()
 
 
 class LlamaCppClient:
@@ -41,14 +84,17 @@ class LlamaCppClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """Call /v1/chat/completions. Falls back to no-tools on 500."""
+        """Call /v1/chat/completions and strip thinking blocks from the reply."""
         payload: dict[str, Any] = {
             "messages": messages,
             "stream": False,
             "temperature": 0.3,
             "top_p": 0.9,
-            "max_tokens": 1024,
-            "stop": _LLAMA3_STOP,
+            # Increased from 1024: thinking models consume a portion of this
+            # budget on reasoning tokens before generating the actual reply.
+            # 2048 ensures the response isn't cut off after a long think block.
+            "max_tokens": 2048,
+            "stop": _STOP_TOKENS,
         }
         if tools:
             payload["tools"] = tools
@@ -72,7 +118,16 @@ class LlamaCppClient:
             )
 
         resp.raise_for_status()
-        return await resp.json()  # type: ignore[no-any-return]
+        data: dict[str, Any] = await resp.json()
+
+        # Mutate the response in-place so all callers (agent._run_loop, etc.)
+        # transparently receive clean content without thinking blocks.
+        for choice in data.get("choices", []):
+            msg = choice.get("message", {})
+            if not msg.get("tool_calls"):
+                msg["content"] = strip_thinking(msg)
+
+        return data
 
     async def wait_until_ready(self, retries: int = 20, delay: float = 1.5) -> None:
         session = self._get_session()
