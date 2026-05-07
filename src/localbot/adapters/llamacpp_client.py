@@ -16,17 +16,19 @@ from localbot.config import cfg
 
 log = logging.getLogger(__name__)
 
-# Gemma / GLM-style stop tokens used by this thinking model.
-_STOP_TOKENS = [
-    "<end_of_turn>",   # Gemma native EOS
-    "<|eot_id|>",      # Llama 3 (kept as fallback)
+# Gemma end-of-turn token used for plain-text (non-tool) responses only.
+# Do NOT include this in tool-call requests — it fires inside JSON payloads
+# and truncates tool arguments, causing silent JSONDecodeErrors.
+_PLAIN_STOP_TOKENS = [
+    "<end_of_turn>",
+    "<|eot_id|>",
     "<|end_of_text|>",
     "<|eom_id|>",
 ]
 
 # Matches a full <think>...</think> block, including newlines.
-# Also handles the GLM edge-case where the opening tag is injected by the
-# chat template and omitted from the model output (only </think> is present).
+# The (?:<think>)? handles the GLM/Gemma edge-case where the opening tag is
+# injected by the chat template and absent from the raw model output.
 _THINK_RE = re.compile(
     r"(?:<think>)?.*?</think>",
     re.DOTALL | re.IGNORECASE,
@@ -43,7 +45,6 @@ def strip_thinking(message: dict[str, Any]) -> str:
     In both cases the thinking text is discarded and only the final answer
     is returned. The raw thinking block is logged at DEBUG level.
     """
-    # Case 1: llama.cpp already separated the reasoning into its own field.
     reasoning = message.get("reasoning_content") or ""
     content = message.get("content") or ""
 
@@ -51,15 +52,11 @@ def strip_thinking(message: dict[str, Any]) -> str:
         log.debug("[thinking] %s", reasoning[:500])
         return content.strip()
 
-    # Case 2: thinking block is embedded in content.
     if "</think>" in content:
-        # Capture everything up to and including the closing tag for logging.
         think_match = _THINK_RE.match(content.lstrip())
         if think_match:
             log.debug("[thinking] %s", think_match.group(0)[:500])
-
-        clean = _THINK_RE.sub("", content).strip()
-        return clean
+        return _THINK_RE.sub("", content).strip()
 
     return content.strip()
 
@@ -90,15 +87,16 @@ class LlamaCppClient:
             "stream": False,
             "temperature": 0.3,
             "top_p": 0.9,
-            # Increased from 1024: thinking models consume a portion of this
-            # budget on reasoning tokens before generating the actual reply.
-            # 2048 ensures the response isn't cut off after a long think block.
             "max_tokens": 2048,
-            "stop": _STOP_TOKENS,
         }
+
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+            # Do NOT set stop tokens when tools are enabled.
+            # <end_of_turn> fires inside tool-call JSON and truncates arguments.
+        else:
+            payload["stop"] = _PLAIN_STOP_TOKENS
 
         session = self._get_session()
         resp = await session.post(
@@ -107,21 +105,16 @@ class LlamaCppClient:
             timeout=aiohttp.ClientTimeout(total=cfg.model_timeout_seconds),
         )
 
-        if resp.status == 500 and tools:
-            log.warning("llama-server returned 500 with tools — retrying without tools")
-            payload.pop("tools", None)
-            payload.pop("tool_choice", None)
-            resp = await session.post(
-                f"{self._base}/v1/chat/completions",
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=cfg.model_timeout_seconds),
-            )
-
+        # Raise on all errors — do NOT silently retry without tools on 500.
+        # The old fallback caused the model to respond as if it had no tools,
+        # telling users "I don't have web search access". Errors surface in
+        # logs and are caught by the agent's asyncio.timeout wrapper.
         resp.raise_for_status()
+
         data: dict[str, Any] = await resp.json()
 
-        # Mutate the response in-place so all callers (agent._run_loop, etc.)
-        # transparently receive clean content without thinking blocks.
+        # Strip <think>...</think> blocks from plain-text replies only.
+        # Tool-call messages must not be mutated — their content is JSON.
         for choice in data.get("choices", []):
             msg = choice.get("message", {})
             if not msg.get("tool_calls"):
