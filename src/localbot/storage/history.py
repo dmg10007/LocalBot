@@ -20,9 +20,11 @@ def _con() -> sqlite3.Connection:
 
 def get_history(user_id: str) -> list[Message]:
     con = _con()
+    # Order by id DESC (AUTOINCREMENT) for deterministic ordering when
+    # multiple messages share the same ts (e.g. same-second inserts).
     rows = con.execute(
         "SELECT role, content FROM history WHERE user_id = ? "
-        "ORDER BY ts DESC LIMIT ?",
+        "ORDER BY id DESC LIMIT ?",
         (user_id, cfg.max_history_messages),
     ).fetchall()
     con.close()
@@ -36,12 +38,17 @@ def append_message(user_id: str, role: str, content: str) -> None:
             "INSERT INTO history (user_id, role, content) VALUES (?, ?, ?)",
             (user_id, role, content),
         )
-        # Trim oldest rows beyond the cap using the index on (user_id, ts DESC)
-        con.execute(
-            "DELETE FROM history WHERE user_id = ? AND id NOT IN "
-            "(SELECT id FROM history WHERE user_id = ? ORDER BY ts DESC LIMIT ?)",
-            (user_id, user_id, cfg.max_history_messages),
-        )
+        # Only trim when the row count exceeds the cap to avoid running the
+        # subquery on every insert when history is still below the limit.
+        count = con.execute(
+            "SELECT COUNT(*) FROM history WHERE user_id = ?", (user_id,)
+        ).fetchone()[0]
+        if count > cfg.max_history_messages:
+            con.execute(
+                "DELETE FROM history WHERE user_id = ? AND id NOT IN "
+                "(SELECT id FROM history WHERE user_id = ? ORDER BY id DESC LIMIT ?)",
+                (user_id, user_id, cfg.max_history_messages),
+            )
     con.close()
 
 

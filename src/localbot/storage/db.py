@@ -25,7 +25,11 @@ def init_db() -> None:
                 ts        REAL    NOT NULL DEFAULT (unixepoch('now'))
             );
 
-            -- Index for fast per-user history lookups and trim queries
+            -- Primary index for per-user history lookups ordered by insertion.
+            CREATE INDEX IF NOT EXISTS idx_history_user_id
+                ON history(user_id, id DESC);
+
+            -- Keep the ts-based index for any range queries on timestamps.
             CREATE INDEX IF NOT EXISTS idx_history_user_ts
                 ON history(user_id, ts DESC);
 
