@@ -17,6 +17,11 @@ def _get_int(key: str, default: int) -> int:
     return int(val) if val is not None else default
 
 
+def _get_float(key: str, default: float) -> float:
+    val = os.environ.get(key)
+    return float(val) if val is not None else default
+
+
 @dataclass
 class Config:
     discord_bot_token: str = field(default_factory=lambda: _get("DISCORD_BOT_TOKEN"))
@@ -29,20 +34,18 @@ class Config:
     llama_server_ctx_size: int = field(default_factory=lambda: _get_int("LLAMA_SERVER_CTX_SIZE", 4096))
     llama_server_threads: int = field(default_factory=lambda: _get_int("LLAMA_SERVER_THREADS", 0))
     llama_server_extra_args: str = field(default_factory=lambda: _get("LLAMA_SERVER_EXTRA_ARGS"))
+    # Override auto-detected model family: gemma | llama | mistral | qwen | deepseek | phi
+    # Use this if the model filename doesn't match the auto-detection patterns.
+    llama_server_model_family: str = field(default_factory=lambda: _get("LLAMA_SERVER_MODEL_FAMILY"))
 
     brave_api_key: str = field(default_factory=lambda: _get("BRAVE_API_KEY"))
-    # How many results to return from Brave (upper bound on the result list).
     search_result_count: int = field(default_factory=lambda: _get_int("SEARCH_RESULT_COUNT", 5))
-    # How many of those results to actually fetch and extract content from.
-    # Fewer = faster responses; more = richer context for the LLM.
     search_fetch_count: int = field(default_factory=lambda: _get_int("SEARCH_FETCH_COUNT", 3))
-    # Max characters of extracted page text fed to the LLM per page.
-    # Keep this reasonable — large pages can flood the context window.
     search_fetch_chars: int = field(default_factory=lambda: _get_int("SEARCH_FETCH_CHARS", 1500))
-    # Per-page HTTP fetch timeout in seconds. Independent of tool_timeout_seconds.
     search_fetch_timeout_seconds: int = field(default_factory=lambda: _get_int("SEARCH_FETCH_TIMEOUT_SECONDS", 8))
 
     model_timeout_seconds: int = field(default_factory=lambda: _get_int("MODEL_TIMEOUT_SECONDS", 120))
+    model_temperature: float = field(default_factory=lambda: _get_float("MODEL_TEMPERATURE", 0.3))
     tool_timeout_seconds: int = field(default_factory=lambda: _get_int("TOOL_TIMEOUT_SECONDS", 30))
     request_deadline_seconds: int = field(default_factory=lambda: _get_int("REQUEST_DEADLINE_SECONDS", 300))
 
@@ -56,9 +59,7 @@ class Config:
     scheduler_max_jobs: int = field(default_factory=lambda: _get_int("SCHEDULER_MAX_JOBS", 20))
     scheduler_max_jobs_per_user: int = field(default_factory=lambda: _get_int("SCHEDULER_MAX_JOBS_PER_USER", 5))
 
-    # Rate limiting: minimum seconds between LLM requests per user.
     rate_limit_seconds: int = field(default_factory=lambda: _get_int("RATE_LIMIT_SECONDS", 5))
-    # Maximum accepted input message length (characters).
     max_input_length: int = field(default_factory=lambda: _get_int("MAX_INPUT_LENGTH", 1000))
 
     def __post_init__(self) -> None:
@@ -74,5 +75,4 @@ class Config:
             )
 
 
-# Module-level singleton
 cfg = Config()
