@@ -5,10 +5,14 @@ A lightweight Discord DM bot that runs a local LLM via [llama.cpp](https://githu
 ## Features
 
 - **Conversational chat** with per-user message history
-- **Web search** via Brave Search API with cited sources
+- **Deep web search** via Brave Search API — fetches and summarises actual page content, not just index snippets
+- **Reddit search** — searches Reddit posts and discussions via the unauthenticated JSON API
 - **Scheduled prompts** — users define jobs with natural-language recurrence
+- **Thinking model support** — strips `<think>` blocks from reasoning models (Gemma, GLM, DeepSeek-R1) before sending replies
+- **Rate limiting** — per-user cooldown to prevent inference abuse
 - **Self-healing** — detects llama-server crashes and restarts automatically
-- **Minimal footprint** — discord.py + aiohttp + APScheduler; no heavy ML dependencies
+- **Audit log** — append-only JSONL log of all user messages and bot replies
+- **Minimal footprint** — discord.py + aiohttp + APScheduler + BeautifulSoup4; no heavy ML dependencies
 
 ---
 
@@ -57,24 +61,28 @@ C:\llama\llama-server.exe --version
 ~/llama/llama-server --version
 ```
 
-You don't need to add it to your PATH — you'll point LocalBot at it directly via the `LLAMA_SERVER_EXECUTABLE` setting in `.env`.
+You don't need to add it to your PATH — you'll point LocalBot at it directly via `LLAMA_SERVER_EXECUTABLE` in `.env`.
 
-> **Building from source:** Only needed if you want custom compile flags or cutting-edge commits. Requires CMake and a C++ compiler (Visual Studio Build Tools on Windows). See the [llama.cpp build docs](https://github.com/ggerganov/llama.cpp/blob/master/docs/build.md) for instructions.
+> **Building from source:** Only needed if you want custom compile flags or cutting-edge commits. Requires CMake and a C++ compiler. See the [llama.cpp build docs](https://github.com/ggerganov/llama.cpp/blob/master/docs/build.md).
 
 ### 3. A GGUF model file
 
 Download a quantized GGUF model. A few good starting points:
-- [Llama-3.2-3B-Instruct-Q4_K_M.gguf](https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF) — fast, CPU-friendly (~2 GB)
-- [Mistral-7B-Instruct-v0.3-Q4_K_M.gguf](https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.3-GGUF) — stronger, needs ~6 GB RAM
 
-Note the full path to the downloaded file — you'll need it in `.env`.
+| Model | Size | Notes |
+|---|---|---|
+| [Llama-3.2-3B-Instruct-Q4_K_M](https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF) | ~2 GB | Fast, CPU-friendly |
+| [Mistral-7B-Instruct-v0.3-Q4_K_M](https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.3-GGUF) | ~6 GB | Stronger reasoning |
+| [Gemma-3-1B-it-Thinking](https://huggingface.co/Andycurrent/Gemma-3-1B-it-GLM-4.7-Flash-Heretic-Uncensored-Thinking_GGUF) | ~1 GB | Ultra-light thinking model |
+
+Note the full path to the downloaded `.gguf` file — you'll need it in `.env`.
 
 ### 4. A Discord Bot Token
 
 1. Go to the [Discord Developer Portal](https://discord.com/developers/applications) and create a new application.
 2. Under **Bot**, click **Add Bot** and copy the token.
 3. Enable the **Message Content Intent** under **Privileged Gateway Intents**.
-4. Invite the bot to your server (or use it via DMs) with the `bot` scope and `Send Messages` + `Read Message History` permissions.
+4. Invite the bot with the `bot` scope and `Send Messages` + `Read Message History` permissions.
 
 ---
 
@@ -105,7 +113,7 @@ python -m venv .venv
 # Runtime only
 pip install -e .
 
-# With dev tools (ruff, mypy, pytest) — recommended for contributors
+# With dev tools (ruff, mypy, pytest)
 pip install -e ".[dev]"
 
 # With optional PDF attachment support
@@ -122,7 +130,7 @@ cp .env.example .env
 Copy-Item .env.example .env
 ```
 
-Open `.env` and set at minimum:
+Open `.env` and fill in at minimum:
 
 | Variable | Required | Description |
 |---|---|---|
@@ -135,14 +143,12 @@ Open `.env` and set at minimum:
 Example values on Windows:
 ```env
 LLAMA_SERVER_EXECUTABLE=C:\llama\llama-server.exe
-LLAMA_SERVER_MODEL_PATH=C:\Users\Dalton\models\llama-3.2-3b-instruct-q4_k_m.gguf
+LLAMA_SERVER_MODEL_PATH=C:\Users\You\models\llama-3.2-3b-instruct-q4_k_m.gguf
 ```
 
-All other settings have sensible defaults. See [`.env.example`](.env.example) for the full reference with descriptions.
+All other settings have sensible defaults. See [`.env.example`](.env.example) for the full reference.
 
 ### 5. Create required directories
-
-The bot needs `logs/` and `storage/` directories on first run. Create them manually until auto-creation is implemented in `app.py`:
 
 ```bash
 # macOS / Linux
@@ -155,43 +161,80 @@ New-Item -ItemType Directory -Force -Path logs, storage
 ### 6. Run the bot
 
 ```bash
-# Using the installed script entry point
 localbot
-
-# Or as a Python module
+# or
 python -m localbot
 ```
 
-`llama-server` is started automatically as a subprocess on bot startup. You do **not** need to start it manually.
+`llama-server` is started automatically as a subprocess. You do **not** need to start it manually.
 
 ---
 
 ## Project Layout
 
-> **Note:** The source tree below is the planned layout. Implementation is in progress on the `dev` branch.
-
 ```
 src/localbot/
-├── __main__.py       # `python -m localbot` entry point
-├── app.py            # Entry point & Discord event loop
-├── config.py         # Settings loaded from .env
-├── agent.py          # Core request/tool loop
+├── __main__.py             # `python -m localbot` entry point
+├── app.py                  # Discord event loop + rate limiting
+├── config.py               # All settings loaded from .env
+├── agent.py                # Core request/tool loop
 ├── adapters/
 │   ├── llamacpp_server.py  # llama-server subprocess manager
-│   └── llamacpp_client.py  # OpenAI-compatible HTTP client
+│   └── llamacpp_client.py  # OpenAI-compatible HTTP client + think-strip
 ├── tools/
-│   ├── registry.py   # Tool dispatcher
-│   ├── search.py     # Web / Brave Search
-│   ├── reddit.py     # Reddit JSON API (no auth required)
-│   └── time_tools.py # Current time / timezone helpers
+│   ├── registry.py         # Tool schemas + dispatcher
+│   ├── search.py           # Brave Search + page fetch & summarise
+│   ├── reddit.py           # Reddit JSON API (no auth required)
+│   └── time_tools.py       # Current time / timezone helpers
 ├── scheduler/
-│   ├── service.py    # APScheduler wrapper
-│   └── store.py      # SQLite job persistence
+│   ├── service.py          # APScheduler wrapper
+│   └── store.py            # SQLite job persistence
 ├── storage/
-│   ├── db.py         # Schema init
-│   ├── history.py    # Per-user conversation history
-│   └── audit.py      # JSONL audit log
-└── messaging.py      # Discord message splitting helpers
+│   ├── db.py               # Schema initialisation
+│   ├── history.py          # Per-user conversation history (SQLite)
+│   └── audit.py            # Append-only JSONL audit log
+└── messaging.py            # Discord 2000-char message splitting
+```
+
+---
+
+## Web Search
+
+When a user asks the bot to search for something, it:
+
+1. Queries the **Brave Search API** for the top results
+2. **Concurrently fetches** the top `SEARCH_FETCH_COUNT` pages (default 3)
+3. **Strips HTML** — removes scripts, styles, navbars, and footers; prefers `<article>`/`<main>` for higher signal content
+4. Passes up to `SEARCH_FETCH_CHARS` characters (default 1500) of clean text per page to the LLM
+5. The LLM **summarises the actual page content** and returns a response with source links
+
+Pages that time out, return errors, or are on the skip list (YouTube, Twitter/X, Instagram, TikTok, Facebook) are silently skipped and fall back to the Brave index description.
+
+### Search tuning
+
+| Variable | Default | Notes |
+|---|---|---|
+| `SEARCH_RESULT_COUNT` | `5` | Total results from Brave |
+| `SEARCH_FETCH_COUNT` | `3` | Pages actually fetched and read |
+| `SEARCH_FETCH_CHARS` | `1500` | Max chars of content per page sent to LLM |
+| `SEARCH_FETCH_TIMEOUT_SECONDS` | `8` | Per-page HTTP timeout before skipping |
+
+> **Context window tip:** At `LLAMA_SERVER_CTX_SIZE=4096`, keep `SEARCH_FETCH_CHARS` at 1500 or lower. If you raise the context to 8192, you can safely increase it to 3000 for richer summaries.
+
+---
+
+## Thinking Model Support
+
+LocalBot automatically strips `<think>...</think>` reasoning blocks from models that expose their chain-of-thought (Gemma thinking variants, GLM, DeepSeek-R1). The thinking text is discarded before the reply is sent to Discord. The raw reasoning is logged at `DEBUG` level if you want to inspect it:
+
+```bash
+localbot --log-level DEBUG
+```
+
+To cap how many tokens the model spends thinking (faster responses), add to `LLAMA_SERVER_EXTRA_ARGS`:
+
+```env
+LLAMA_SERVER_EXTRA_ARGS=--reasoning-budget 512
 ```
 
 ---
@@ -202,14 +245,24 @@ Users interact via DM commands:
 
 | Command | Description |
 |---|---|
-| `jobs list` | Show your active jobs |
-| `jobs cancel <id>` | Cancel a job |
-| `timezone set <IANA>` | Set your local timezone |
+| `jobs list` | Show your active scheduled jobs |
+| `jobs cancel <id>` | Cancel a job by ID |
+| `timezone set <IANA>` | Set your local timezone (e.g. `America/New_York`) |
 | `timezone show` | Show your saved timezone |
-| `time now` | Show current time |
+| `time now` | Show the current time in your timezone |
 
 To schedule a job, just ask the bot naturally:
 > "Remind me every morning at 8am to review my task list"
+
+---
+
+## Security Notes
+
+- The bot is designed for **personal/trusted-user use**. All user messages are stored in SQLite and logged to an audit file.
+- Per-user rate limiting (`RATE_LIMIT_SECONDS`, default 5s) prevents inference spam.
+- Input length is capped at `MAX_INPUT_LENGTH` characters (default 1000) before hitting the LLM.
+- Scheduler jobs are capped per user (`SCHEDULER_MAX_JOBS_PER_USER`, default 5).
+- The audit log at `AUDIT_LOG_PATH` records all interactions for review.
 
 ---
 
