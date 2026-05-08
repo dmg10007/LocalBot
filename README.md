@@ -8,7 +8,8 @@ A lightweight Discord DM bot that runs a local LLM via [llama.cpp](https://githu
 - **Deep web search** via Brave Search API — fetches and summarises actual page content, not just index snippets
 - **Reddit search** — searches Reddit posts and discussions via the unauthenticated JSON API
 - **Scheduled prompts** — users define jobs with natural-language recurrence
-- **Thinking model support** — strips `<think>` blocks from reasoning models (Gemma, GLM, DeepSeek-R1) before sending replies
+- **Model-agnostic inference** — auto-detects model family on startup; swap models by changing one line in `.env`
+- **Thinking model support** — automatically strips `<think>` blocks for reasoning models (Gemma, DeepSeek, Qwen)
 - **Rate limiting** — per-user cooldown to prevent inference abuse
 - **Self-healing** — detects llama-server crashes and restarts automatically
 - **Audit log** — append-only JSONL log of all user messages and bot replies
@@ -139,6 +140,8 @@ Open `.env` and fill in at minimum:
 | `LLAMA_SERVER_EXECUTABLE` | ✅ | Full path to the `llama-server` binary |
 | `LLAMA_SERVER_N_GPU_LAYERS` | — | `0` = CPU only (default), `-1` = all layers on GPU |
 | `BRAVE_API_KEY` | — | Leave blank to disable web search |
+| `LLAMA_SERVER_MODEL_FAMILY` | — | Leave blank for auto-detection (see [Swapping Models](#swapping-models)) |
+| `MODEL_TEMPERATURE` | — | Default `0.3`; try `0.1` for smaller/chattier models |
 
 Example values on Windows:
 ```env
@@ -180,7 +183,7 @@ src/localbot/
 ├── agent.py                # Core request/tool loop
 ├── adapters/
 │   ├── llamacpp_server.py  # llama-server subprocess manager
-│   └── llamacpp_client.py  # OpenAI-compatible HTTP client + think-strip
+│   └── llamacpp_client.py  # OpenAI-compatible HTTP client, model detection, think-strip
 ├── tools/
 │   ├── registry.py         # Tool schemas + dispatcher
 │   ├── search.py           # Brave Search + page fetch & summarise
@@ -195,6 +198,44 @@ src/localbot/
 │   └── audit.py            # Append-only JSONL audit log
 └── messaging.py            # Discord 2000-char message splitting
 ```
+
+---
+
+## Swapping Models
+
+To try a different model, update `LLAMA_SERVER_MODEL_PATH` in `.env` and restart. No other changes are needed.
+
+On startup LocalBot queries `/v1/models`, reads the loaded filename, and automatically applies the correct stop tokens and think-stripping for the detected family:
+
+| Family | Matched by filename | Stop tokens | Think-strip |
+|---|---|---|---|
+| `GEMMA` | `gemma`, `glm` | `<end_of_turn>`, `<eos>` | ✅ |
+| `LLAMA` | `llama` | `<\|eot_id\|>`, `<\|end_of_text\|>` | ❌ |
+| `MISTRAL` | `mistral`, `mixtral` | `</s>`, `[INST]` | ❌ |
+| `QWEN` | `qwen` | `<\|im_end\|>` | ✅ |
+| `DEEPSEEK` | `deepseek` | `<\u2514\u2518>`, `<\|end_of_sentence\|>` | ✅ |
+| `PHI` | `phi` | `<\|end\|>` | ❌ |
+| `UNKNOWN` | anything else | *(GGUF-embedded EOS)* | ❌ |
+
+The detected family is logged on every start so you can confirm it:
+
+```
+INFO  Detected model: 'Gemma-3-1B-...' → family=GEMMA (stop=['<end_of_turn>', '<eos>'], think_strip=True)
+```
+
+If the detection is wrong (e.g. a fine-tune with an unusual filename), override it manually:
+
+```env
+LLAMA_SERVER_MODEL_FAMILY=gemma
+```
+
+### Temperature guidance by model size
+
+| Model size | Recommended `MODEL_TEMPERATURE` | Reason |
+|---|---|---|
+| 1B–3B | `0.1`–`0.2` | Smaller models ramble at higher temps; lower keeps output focused |
+| 7B | `0.3` | Default; good balance of coherence and variety |
+| 13B+ | `0.4`–`0.7` | Larger models handle higher temps well; more natural responses |
 
 ---
 
@@ -225,7 +266,9 @@ Pages that time out, return errors, or are on the skip list (YouTube, Twitter/X,
 
 ## Thinking Model Support
 
-LocalBot automatically strips `<think>...</think>` reasoning blocks from models that expose their chain-of-thought (Gemma thinking variants, GLM, DeepSeek-R1). The thinking text is discarded before the reply is sent to Discord. The raw reasoning is logged at `DEBUG` level if you want to inspect it:
+Think-stripping is applied automatically based on the detected model family — no configuration needed. Models in the `GEMMA`, `DEEPSEEK`, and `QWEN` families have it enabled; all others skip it entirely.
+
+The raw reasoning is logged at `DEBUG` level if you want to inspect it:
 
 ```bash
 localbot --log-level DEBUG
