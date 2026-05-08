@@ -16,31 +16,84 @@ from localbot.tools.registry import TOOL_SCHEMAS, dispatch
 
 log = logging.getLogger(__name__)
 
+# Directive system prompt with a concrete tool-call example.
+# Small models (1B–3B) need explicit format guidance — without it they
+# write *about* calling tools instead of emitting a tool_calls JSON block.
 SYSTEM_PROMPT = """\
-You are a helpful, concise assistant running locally via llama.cpp.
+You are a helpful, concise assistant. You have three tools:
+- web_search(query) — search the web for current information
+- reddit_search(query, subreddit?) — search Reddit posts
+- get_current_time(timezone?) — get the current date and time
 
-You have access to tools for web search, Reddit search, and getting the current time.
-Only call tools when the user EXPLICITLY asks for information that requires them.
-For greetings, casual chat, or anything conversational — respond directly without calling any tools.
-After receiving tool results, always summarise them into a clear, helpful reply for the user.
-Never call the same tool with the same arguments twice in one conversation turn.
-Keep responses concise and friendly.
+RULES:
+1. When the user asks you to search, look something up, or find current news —
+   you MUST call the tool immediately. Do NOT describe what you will do.
+   Do NOT say "I will search". Do NOT fabricate results or use placeholders.
+   Just call the tool.
+2. After receiving tool results, write a clear, concise summary with source links.
+3. For casual conversation, greetings, or simple questions you can answer from
+   knowledge — respond directly without calling any tools.
+4. Never call the same tool with the same arguments twice in one turn.
+5. Keep responses concise and friendly.
 """
 
-# Use fullmatch so the entire message must match — not just a prefix.
+# Phrases that indicate the model echoed the system prompt as its reply.
+# If detected, the reply is discarded and a plain synthesis is forced.
+_SYSTEM_ECHO_PHRASES = (
+    "you are a helpful, concise assistant",
+    "i will only call tools when",
+    "i have access to tools for web search",
+    "running locally via llama.cpp",
+)
+
+# Conversational messages that never need tool access.
 _CONVERSATIONAL = re.compile(
     r"(hi+|hello+|hey+|howdy|sup|what'?s up|how are you|how r u|"
     r"good (morning|evening|afternoon|night)|thanks?( you)?|thank you|"
     r"ok(ay)?|sure|cool|great|nice|awesome|sounds good|got it|"
-    r"bye|goodbye|see ya|later|lol|haha|yes|no|yep|nope|:\.?[)|(|D])\.?\!?",
+    r"bye|goodbye|see ya|later|lol|haha|:?\.?[)|(|D])\.?\!?",
+    re.IGNORECASE,
+)
+
+# Keywords that signal search intent in a message or prior history.
+_SEARCH_INTENT = re.compile(
+    r"\b(search|look up|lookup|find|news|latest|current|today|trending|top stories)",
     re.IGNORECASE,
 )
 
 
-def _needs_tools(message: str) -> bool:
-    # fullmatch ensures the whole (stripped) message is conversational,
-    # not just a conversational prefix followed by a real request.
-    return not bool(_CONVERSATIONAL.fullmatch(message.strip()))
+def _needs_tools(message: str, history: list[dict[str, Any]]) -> bool:
+    """Return True if this turn should have tools available.
+
+    Tools are enabled when:
+    - The current message contains search/lookup intent, OR
+    - The message is not purely conversational, OR
+    - A recent assistant reply in history discussed searching
+      (i.e. the user is following up on a search request).
+    """
+    stripped = message.strip()
+
+    # Always enable tools if the message itself has search intent.
+    if _SEARCH_INTENT.search(stripped):
+        return True
+
+    # Check if the last assistant message discussed searching — this catches
+    # confirmation replies like "Yes" or "Try again" that follow a search ask.
+    for turn in reversed(history[-4:]):
+        if turn.get("role") == "assistant":
+            content = turn.get("content") or ""
+            if _SEARCH_INTENT.search(content):
+                return True
+            break  # Only look at the most recent assistant turn.
+
+    # Pure conversational message with no search context.
+    return not bool(_CONVERSATIONAL.fullmatch(stripped))
+
+
+def _is_system_echo(content: str) -> bool:
+    """Return True if the model echoed the system prompt as its reply."""
+    lower = content.lower().strip()
+    return any(lower.startswith(phrase) or phrase in lower[:200] for phrase in _SYSTEM_ECHO_PHRASES)
 
 
 class Agent:
@@ -63,7 +116,7 @@ class Agent:
 
         try:
             async with asyncio.timeout(cfg.request_deadline_seconds):
-                tools = TOOL_SCHEMAS if _needs_tools(user_message) else None
+                tools = TOOL_SCHEMAS if _needs_tools(user_message, history) else None
                 reply = await self._run_loop(messages, tools)
         except asyncio.TimeoutError:
             reply = "Sorry, your request took too long and was cancelled."
@@ -78,19 +131,27 @@ class Agent:
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None
     ) -> str:
         """Tool loop. messages is local-only — tool turns are never written to history."""
-        # Track (tool_name, args_json) pairs called this turn to prevent duplicate calls.
         called: set[tuple[str, str]] = set()
 
         for iteration in range(cfg.max_tool_iterations + 1):
             response = await self._client.chat(messages, tools=tools)
             choice = response["choices"][0]
             msg = choice["message"]
+            content = msg.get("content") or ""
 
             if not msg.get("tool_calls"):
-                return msg.get("content") or ""
+                # Guard: if the model echoed the system prompt, force a plain
+                # synthesis so the user gets something useful.
+                if _is_system_echo(content):
+                    log.warning("Model echoed system prompt — forcing synthesis.")
+                    synth = await self._client.chat(
+                        messages + [{"role": "user", "content": "Please answer the question above directly and concisely."}],
+                        tools=None,
+                    )
+                    return synth["choices"][0]["message"].get("content") or ""
+                return content
 
             if iteration == cfg.max_tool_iterations:
-                # Iteration budget exhausted — force a plain-text synthesis.
                 messages.append({"role": "assistant", "content": None, "tool_calls": msg["tool_calls"]})
                 messages.append({
                     "role": "user",
@@ -113,8 +174,6 @@ class Agent:
                 dedup_key = (name, json.dumps(args, sort_keys=True))
 
                 if dedup_key in called:
-                    # Model is repeating a call it already made — inject a
-                    # cached notice so it moves on instead of looping.
                     log.warning("Duplicate tool call blocked: %s(%s)", name, args)
                     messages.append({
                         "role": "tool",
@@ -138,7 +197,6 @@ class Agent:
                 })
 
             if not any_new:
-                # Every call in this batch was a duplicate — force synthesis now.
                 messages.append({
                     "role": "user",
                     "content": "You have all the information needed. Please give your final answer now.",
