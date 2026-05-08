@@ -31,7 +31,16 @@ class Config:
     llama_server_extra_args: str = field(default_factory=lambda: _get("LLAMA_SERVER_EXTRA_ARGS"))
 
     brave_api_key: str = field(default_factory=lambda: _get("BRAVE_API_KEY"))
+    # How many results to return from Brave (upper bound on the result list).
     search_result_count: int = field(default_factory=lambda: _get_int("SEARCH_RESULT_COUNT", 5))
+    # How many of those results to actually fetch and extract content from.
+    # Fewer = faster responses; more = richer context for the LLM.
+    search_fetch_count: int = field(default_factory=lambda: _get_int("SEARCH_FETCH_COUNT", 3))
+    # Max characters of extracted page text fed to the LLM per page.
+    # Keep this reasonable — large pages can flood the context window.
+    search_fetch_chars: int = field(default_factory=lambda: _get_int("SEARCH_FETCH_CHARS", 1500))
+    # Per-page HTTP fetch timeout in seconds. Independent of tool_timeout_seconds.
+    search_fetch_timeout_seconds: int = field(default_factory=lambda: _get_int("SEARCH_FETCH_TIMEOUT_SECONDS", 8))
 
     model_timeout_seconds: int = field(default_factory=lambda: _get_int("MODEL_TIMEOUT_SECONDS", 120))
     tool_timeout_seconds: int = field(default_factory=lambda: _get_int("TOOL_TIMEOUT_SECONDS", 30))
