@@ -26,12 +26,14 @@ _FETCH_UA = (
 )
 
 # Domains that reliably block scrapers or return useless content.
+# Fix #9: "pdf" is removed from this set — it was matching any URL containing
+# the substring "pdf" (e.g. /pdf-guide/). PDF files are now detected in
+# _should_skip() via an endswith() check on the path instead.
 _SKIP_DOMAINS = frozenset([
     "youtube.com", "youtu.be",
     "twitter.com", "x.com",
     "instagram.com", "facebook.com",
     "tiktok.com",
-    "pdf",  # skip raw PDF URLs
 ])
 
 
@@ -53,6 +55,11 @@ async def close_session() -> None:
 def _should_skip(url: str) -> bool:
     """Return True for URLs we know won't yield useful scraped text."""
     lower = url.lower()
+    # Fix #9: detect raw PDF URLs by checking the path extension, not by
+    # substring matching which incorrectly skips /pdf-guide/, pdfhost.io, etc.
+    path = lower.split("?")[0]  # strip query string before checking extension
+    if path.endswith(".pdf"):
+        return True
     return any(domain in lower for domain in _SKIP_DOMAINS)
 
 
@@ -145,7 +152,6 @@ async def web_search(query: str) -> str:
         url = r.get("url", "")
         description = r.get("description", "")
 
-        # Use fetched page content if available, else fall back to description.
         fetched_idx = i - 1
         page_content: str | None = None
         if fetched_idx < len(page_texts) and page_texts[fetched_idx]:
