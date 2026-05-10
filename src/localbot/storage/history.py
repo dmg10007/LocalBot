@@ -32,7 +32,7 @@ def get_history(user_id: str) -> list[Message]:
 
 def append_message(user_id: str, role: str, content: str) -> None:
     # Fix #1 & #12: use closing() for safety; drop the COUNT(*) — the
-    # DELETE ... NOT IN ... is a no-op when history is already within the cap,
+    # DELETE … NOT IN … is a no-op when history is already within the cap,
     # so running it unconditionally is simpler and avoids an extra round-trip.
     with closing(_con()) as con:
         with con:

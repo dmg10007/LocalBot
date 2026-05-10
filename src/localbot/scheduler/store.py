@@ -60,11 +60,10 @@ def all_jobs() -> list[Job]:
 
 
 def count_jobs_atomic(user_id: str) -> tuple[int, int]:
-    """Return (global_total, user_total) in a single DB connection.
+    """Return (global_total, user_total) in a single DB round-trip.
 
-    Fix #4: reading both counts in one connection eliminates the TOCTOU
-    race that existed when add_job() called all_jobs() and list_jobs()
-    as two separate round-trips.
+    Fix #4: eliminates the TOCTOU race in add_job by reading both counts
+    inside the same connection before the caller decides whether to insert.
     """
     with closing(_con()) as con:
         total = con.execute("SELECT COUNT(*) FROM scheduled_jobs").fetchone()[0]
