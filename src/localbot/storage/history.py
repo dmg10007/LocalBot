@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from typing import TypedDict
 
 from localbot.config import cfg
@@ -19,41 +20,34 @@ def _con() -> sqlite3.Connection:
 
 
 def get_history(user_id: str) -> list[Message]:
-    con = _con()
-    # Order by id DESC (AUTOINCREMENT) for deterministic ordering when
-    # multiple messages share the same ts (e.g. same-second inserts).
-    rows = con.execute(
-        "SELECT role, content FROM history WHERE user_id = ? "
-        "ORDER BY id DESC LIMIT ?",
-        (user_id, cfg.max_history_messages),
-    ).fetchall()
-    con.close()
+    # Fix #1: use closing() to guarantee the connection is released even on error.
+    with closing(_con()) as con:
+        rows = con.execute(
+            "SELECT role, content FROM history WHERE user_id = ? "
+            "ORDER BY id DESC LIMIT ?",
+            (user_id, cfg.max_history_messages),
+        ).fetchall()
     return [{"role": r, "content": c} for r, c in reversed(rows)]
 
 
 def append_message(user_id: str, role: str, content: str) -> None:
-    con = _con()
-    with con:
-        con.execute(
-            "INSERT INTO history (user_id, role, content) VALUES (?, ?, ?)",
-            (user_id, role, content),
-        )
-        # Only trim when the row count exceeds the cap to avoid running the
-        # subquery on every insert when history is still below the limit.
-        count = con.execute(
-            "SELECT COUNT(*) FROM history WHERE user_id = ?", (user_id,)
-        ).fetchone()[0]
-        if count > cfg.max_history_messages:
+    # Fix #1 & #12: use closing() for safety; drop the COUNT(*) — the
+    # DELETE ... NOT IN ... is a no-op when history is already within the cap,
+    # so running it unconditionally is simpler and avoids an extra round-trip.
+    with closing(_con()) as con:
+        with con:
+            con.execute(
+                "INSERT INTO history (user_id, role, content) VALUES (?, ?, ?)",
+                (user_id, role, content),
+            )
             con.execute(
                 "DELETE FROM history WHERE user_id = ? AND id NOT IN "
                 "(SELECT id FROM history WHERE user_id = ? ORDER BY id DESC LIMIT ?)",
                 (user_id, user_id, cfg.max_history_messages),
             )
-    con.close()
 
 
 def clear_history(user_id: str) -> None:
-    con = _con()
-    with con:
-        con.execute("DELETE FROM history WHERE user_id = ?", (user_id,))
-    con.close()
+    with closing(_con()) as con:
+        with con:
+            con.execute("DELETE FROM history WHERE user_id = ?", (user_id,))
