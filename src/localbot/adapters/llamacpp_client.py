@@ -30,8 +30,6 @@ class ModelFamily(Enum):
 
 
 # Name-pattern → family. Checked in order; first match wins.
-# Patterns are matched case-insensitively against the model ID returned
-# by /v1/models (which is usually the filename of the .gguf).
 _FAMILY_PATTERNS: list[tuple[re.Pattern[str], ModelFamily]] = [
     (re.compile(r"gemma|glm",        re.I), ModelFamily.GEMMA),
     (re.compile(r"llama",            re.I), ModelFamily.LLAMA),
@@ -41,8 +39,7 @@ _FAMILY_PATTERNS: list[tuple[re.Pattern[str], ModelFamily]] = [
     (re.compile(r"phi",              re.I), ModelFamily.PHI),
 ]
 
-# Stop tokens per family. Only used for plain-text (non-tool) responses.
-# Tool-call responses never get stop tokens — they fire inside JSON.
+# Stop tokens per family.
 _STOP_TOKENS: dict[ModelFamily, list[str]] = {
     ModelFamily.GEMMA:    ["<end_of_turn>", "<eos>"],
     ModelFamily.LLAMA:    ["<|eot_id|>", "<|end_of_text|>", "<|eom_id|>"],
@@ -50,15 +47,11 @@ _STOP_TOKENS: dict[ModelFamily, list[str]] = {
     ModelFamily.QWEN:     ["<|im_end|>", "<|endoftext|>"],
     ModelFamily.DEEPSEEK: ["<└┘>", "<|end_of_sentence|>"],
     ModelFamily.PHI:      ["<|end|>", "<|endoftext|>"],
-    ModelFamily.UNKNOWN:  [],  # Let llama-server use the GGUF-embedded EOS.
+    ModelFamily.UNKNOWN:  [],
 }
 
-# Families that emit <think>...</think> reasoning blocks.
 _THINKING_FAMILIES = {ModelFamily.GEMMA, ModelFamily.DEEPSEEK, ModelFamily.QWEN}
 
-# Matches a full <think>...</think> block, including newlines.
-# The (?:<think>)? handles the GLM/Gemma edge-case where the opening tag is
-# injected by the chat template and absent from the raw model output.
 _THINK_RE = re.compile(
     r"(?:<think>)?.*?</think>",
     re.DOTALL | re.IGNORECASE,
@@ -66,7 +59,6 @@ _THINK_RE = re.compile(
 
 
 def _detect_family_from_name(model_name: str) -> ModelFamily:
-    """Classify a model name string into a ModelFamily."""
     for pattern, family in _FAMILY_PATTERNS:
         if pattern.search(model_name):
             return family
@@ -74,12 +66,7 @@ def _detect_family_from_name(model_name: str) -> ModelFamily:
 
 
 def strip_thinking(message: dict[str, Any]) -> str:
-    """Extract the user-facing reply, discarding any <think> reasoning block.
-
-    llama.cpp surfaces thinking-model output in one of two ways:
-      1. A separate ``reasoning_content`` field (preferred — already split).
-      2. Inside ``content`` as a ``<think>...</think>`` block before the reply.
-    """
+    """Extract the user-facing reply, discarding any <think> reasoning block."""
     reasoning = message.get("reasoning_content") or ""
     content = message.get("content") or ""
 
@@ -120,7 +107,6 @@ class LlamaCppClient:
         (LLAMA_SERVER_MODEL_FAMILY) takes priority over auto-detection
         for fine-tunes or models with unusual filenames.
         """
-        # Env override: LLAMA_SERVER_MODEL_FAMILY=gemma|llama|mistral|qwen|deepseek|phi
         override = cfg.llama_server_model_family.lower().strip()
         if override:
             family_map = {
@@ -138,7 +124,6 @@ class LlamaCppClient:
                 return
             log.warning("Unknown LLAMA_SERVER_MODEL_FAMILY value '%s' — falling back to auto-detect.", override)
 
-        # Auto-detect from /v1/models.
         session = self._get_session()
         try:
             async with session.get(
@@ -179,8 +164,6 @@ class LlamaCppClient:
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
-            # Never set stop tokens when tools are active — they fire inside
-            # tool-call JSON and truncate arguments.
         else:
             stop = _STOP_TOKENS[self._family]
             if stop:
@@ -195,7 +178,6 @@ class LlamaCppClient:
         resp.raise_for_status()
         data: dict[str, Any] = await resp.json()
 
-        # Strip <think> blocks only for families known to emit them.
         is_thinking_model = self._family in _THINKING_FAMILIES
         for choice in data.get("choices", []):
             msg = choice.get("message", {})
@@ -217,7 +199,10 @@ class LlamaCppClient:
                 ) as r:
                     if r.status == 200:
                         log.info("llama-server is ready")
-                        await self.detect_model()
+                        # Fix #13: detect_model only needs to run once — skip
+                        # subsequent calls once the family has been identified.
+                        if self._family is ModelFamily.UNKNOWN:
+                            await self.detect_model()
                         return
             except Exception:
                 pass

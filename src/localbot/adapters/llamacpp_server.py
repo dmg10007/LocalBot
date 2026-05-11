@@ -15,6 +15,9 @@ log = logging.getLogger(__name__)
 class LlamaCppServer:
     def __init__(self) -> None:
         self._proc: Process | None = None
+        # Fix #20: track the background log-reader task so it can be cancelled
+        # cleanly when the server is stopped.
+        self._log_task: asyncio.Task | None = None
 
     async def start(self) -> None:
         """Launch llama-server as a subprocess."""
@@ -44,11 +47,36 @@ class LlamaCppServer:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
-        # No sleep here — wait_until_ready() polls /health and returns as soon
-        # as the server is accepting connections, avoiding unnecessary delay.
+        # Fix #20: launch a background task to drain subprocess stdout into
+        # our logger. Without this, llama-server output (including OOM and
+        # CUDA errors) was silently discarded.
+        self._log_task = asyncio.create_task(self._pipe_logs())
         log.info("llama-server process started (pid=%s), waiting for readiness...", self._proc.pid)
 
+    async def _pipe_logs(self) -> None:
+        """Read llama-server stdout line-by-line and forward to our logger."""
+        if self._proc is None or self._proc.stdout is None:
+            return
+        try:
+            async for line in self._proc.stdout:
+                decoded = line.decode(errors="replace").rstrip()
+                if decoded:
+                    log.debug("[llama-server] %s", decoded)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            log.warning("llama-server log reader stopped unexpectedly: %s", exc)
+
     async def stop(self) -> None:
+        # Cancel the log-reader task before terminating the process.
+        if self._log_task and not self._log_task.done():
+            self._log_task.cancel()
+            try:
+                await self._log_task
+            except asyncio.CancelledError:
+                pass
+        self._log_task = None
+
         if self._proc and self._proc.returncode is None:
             self._proc.terminate()
             try:

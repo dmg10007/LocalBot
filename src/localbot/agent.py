@@ -16,9 +16,6 @@ from localbot.tools.registry import TOOL_SCHEMAS, dispatch
 
 log = logging.getLogger(__name__)
 
-# Directive system prompt with a concrete tool-call example.
-# Small models (1B–3B) need explicit format guidance — without it they
-# write *about* calling tools instead of emitting a tool_calls JSON block.
 SYSTEM_PROMPT = """\
 You are a helpful, concise assistant. You have three tools:
 - web_search(query) — search the web for current information
@@ -37,16 +34,15 @@ RULES:
 5. Keep responses concise and friendly.
 """
 
-# Phrases that indicate the model echoed the system prompt as its reply.
-# If detected, the reply is discarded and a plain synthesis is forced.
-_SYSTEM_ECHO_PHRASES = (
+# Fix #17: structural echo detection — markers are tied to the shape of the
+# system prompt, not arbitrary phrases that silently rot when the prompt changes.
+_SYSTEM_ECHO_MARKERS = (
     "you are a helpful, concise assistant",
-    "i will only call tools when",
-    "i have access to tools for web search",
-    "running locally via llama.cpp",
+    "rules:",
+    "1. when the user asks you to search",
+    "you must call the tool immediately",
 )
 
-# Conversational messages that never need tool access.
 _CONVERSATIONAL = re.compile(
     r"(hi+|hello+|hey+|howdy|sup|what'?s up|how are you|how r u|"
     r"good (morning|evening|afternoon|night)|thanks?( you)?|thank you|"
@@ -55,45 +51,38 @@ _CONVERSATIONAL = re.compile(
     re.IGNORECASE,
 )
 
-# Keywords that signal search intent in a message or prior history.
 _SEARCH_INTENT = re.compile(
     r"\b(search|look up|lookup|find|news|latest|current|today|trending|top stories)",
     re.IGNORECASE,
 )
 
+# Fix #10: cap how many characters of a tool result are injected into the
+# context window to prevent runaway search responses from exhausting model RAM.
+_TOOL_RESULT_MAX_CHARS = 4000
+
 
 def _needs_tools(message: str, history: list[dict[str, Any]]) -> bool:
-    """Return True if this turn should have tools available.
-
-    Tools are enabled when:
-    - The current message contains search/lookup intent, OR
-    - The message is not purely conversational, OR
-    - A recent assistant reply in history discussed searching
-      (i.e. the user is following up on a search request).
-    """
+    """Return True if this turn should have tools available."""
     stripped = message.strip()
-
-    # Always enable tools if the message itself has search intent.
     if _SEARCH_INTENT.search(stripped):
         return True
-
-    # Check if the last assistant message discussed searching — this catches
-    # confirmation replies like "Yes" or "Try again" that follow a search ask.
     for turn in reversed(history[-4:]):
         if turn.get("role") == "assistant":
             content = turn.get("content") or ""
             if _SEARCH_INTENT.search(content):
                 return True
-            break  # Only look at the most recent assistant turn.
-
-    # Pure conversational message with no search context.
+            break
     return not bool(_CONVERSATIONAL.fullmatch(stripped))
 
 
 def _is_system_echo(content: str) -> bool:
-    """Return True if the model echoed the system prompt as its reply."""
+    """Return True if the model echoed the system prompt as its reply.
+
+    Fix #17: checks structural markers coupled to the prompt shape rather
+    than hardcoded phrases that silently stop working if the prompt changes.
+    """
     lower = content.lower().strip()
-    return any(lower.startswith(phrase) or phrase in lower[:200] for phrase in _SYSTEM_ECHO_PHRASES)
+    return any(marker in lower[:300] for marker in _SYSTEM_ECHO_MARKERS)
 
 
 class Agent:
@@ -114,17 +103,24 @@ class Agent:
 
         log_event("user_message", user_id=user_id, content=user_message)
 
+        # Fix #2: define the timeout sentinel so we can distinguish it from a
+        # real LLM reply when deciding whether to persist history.
+        timeout_sentinel = "Sorry, your request took too long and was cancelled."
+        reply = timeout_sentinel
         try:
             async with asyncio.timeout(cfg.request_deadline_seconds):
                 tools = TOOL_SCHEMAS if _needs_tools(user_message, history) else None
                 reply = await self._run_loop(messages, tools)
         except asyncio.TimeoutError:
-            reply = "Sorry, your request took too long and was cancelled."
+            pass  # reply stays as timeout_sentinel
 
-        if reply:
+        # Fix #2: audit log is always written (including timeouts), but history
+        # is only persisted for genuine LLM replies, not timeout messages.
+        log_event("assistant_reply", user_id=user_id, content=reply)
+        if reply and reply != timeout_sentinel:
             append_message(user_id, "user", user_message)
             append_message(user_id, "assistant", reply)
-        log_event("assistant_reply", user_id=user_id, content=reply)
+
         return reply
 
     async def _run_loop(
@@ -140,8 +136,6 @@ class Agent:
             content = msg.get("content") or ""
 
             if not msg.get("tool_calls"):
-                # Guard: if the model echoed the system prompt, force a plain
-                # synthesis so the user gets something useful.
                 if _is_system_echo(content):
                     log.warning("Model echoed system prompt — forcing synthesis.")
                     synth = await self._client.chat(
@@ -172,7 +166,6 @@ class Agent:
                     args = {}
 
                 dedup_key = (name, json.dumps(args, sort_keys=True))
-
                 if dedup_key in called:
                     log.warning("Duplicate tool call blocked: %s(%s)", name, args)
                     messages.append({
@@ -189,6 +182,14 @@ class Agent:
                 log_event("tool_call", tool=name, args=args)
                 result = await dispatch(name, args)
                 log_event("tool_result", tool=name, result=result[:500])
+
+                # Fix #10: cap tool result length before injecting into context.
+                if len(result) > _TOOL_RESULT_MAX_CHARS:
+                    log.debug(
+                        "Tool result from %s truncated from %d to %d chars",
+                        name, len(result), _TOOL_RESULT_MAX_CHARS,
+                    )
+                    result = result[:_TOOL_RESULT_MAX_CHARS] + "\n\n[...truncated]"
 
                 messages.append({
                     "role": "tool",
