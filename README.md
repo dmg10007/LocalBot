@@ -4,15 +4,16 @@ A lightweight Discord DM bot that runs a local LLM via [llama.cpp](https://githu
 
 ## Features
 
-- **Conversational chat** with per-user message history
+- **Conversational chat** with per-user message history (SQLite-backed)
 - **Deep web search** via Brave Search API — fetches and summarises actual page content, not just index snippets
 - **Reddit search** — searches Reddit posts and discussions via the unauthenticated JSON API
-- **Scheduled prompts** — users define jobs with natural-language recurrence
-- **Model-agnostic inference** — auto-detects model family on startup; swap models by changing one line in `.env`
+- **Scheduled prompts** — users define recurring jobs with natural-language requests; validated cron expressions prevent abuse
+- **Model-agnostic inference** — auto-detects model family once on startup; swap models by changing one line in `.env`
 - **Thinking model support** — automatically strips `<think>` blocks for reasoning models (Gemma, DeepSeek, Qwen)
-- **Rate limiting** — per-user cooldown to prevent inference abuse
+- **Rate limiting** — per-user cooldown with bounded memory (stale entries are automatically evicted)
 - **Self-healing** — detects llama-server crashes and restarts automatically
-- **Audit log** — append-only JSONL log of all user messages and bot replies
+- **Audit log** — append-only JSONL log of all user messages and bot replies (timeouts are logged separately from genuine replies)
+- **llama-server log capture** — subprocess stdout is piped into the application logger so crashes (OOM, CUDA errors) surface immediately
 - **Minimal footprint** — discord.py + aiohttp + APScheduler + BeautifulSoup4; no heavy ML dependencies
 
 ---
@@ -169,7 +170,7 @@ localbot
 python -m localbot
 ```
 
-`llama-server` is started automatically as a subprocess. You do **not** need to start it manually.
+`llama-server` is started automatically as a subprocess. You do **not** need to start it manually. Its output (including any crash messages) is captured and forwarded to the application log.
 
 ---
 
@@ -182,7 +183,7 @@ src/localbot/
 ├── config.py               # All settings loaded from .env
 ├── agent.py                # Core request/tool loop
 ├── adapters/
-│   ├── llamacpp_server.py  # llama-server subprocess manager
+│   ├── llamacpp_server.py  # llama-server subprocess manager + log capture
 │   └── llamacpp_client.py  # OpenAI-compatible HTTP client, model detection, think-strip
 ├── tools/
 │   ├── registry.py         # Tool schemas + dispatcher
@@ -190,8 +191,8 @@ src/localbot/
 │   ├── reddit.py           # Reddit JSON API (no auth required)
 │   └── time_tools.py       # Current time / timezone helpers
 ├── scheduler/
-│   ├── service.py          # APScheduler wrapper
-│   └── store.py            # SQLite job persistence
+│   ├── service.py          # APScheduler wrapper + cron validation
+│   └── store.py            # SQLite job persistence + atomic limit checks
 ├── storage/
 │   ├── db.py               # Schema initialisation
 │   ├── history.py          # Per-user conversation history (SQLite)
@@ -205,7 +206,7 @@ src/localbot/
 
 To try a different model, update `LLAMA_SERVER_MODEL_PATH` in `.env` and restart. No other changes are needed.
 
-On startup LocalBot queries `/v1/models`, reads the loaded filename, and automatically applies the correct stop tokens and think-stripping for the detected family:
+On startup LocalBot queries `/v1/models`, reads the loaded filename, and automatically applies the correct stop tokens and think-stripping for the detected family. Detection runs only once — subsequent readiness probes reuse the cached result.
 
 | Family | Matched by filename | Stop tokens | Think-strip |
 |---|---|---|---|
@@ -213,7 +214,7 @@ On startup LocalBot queries `/v1/models`, reads the loaded filename, and automat
 | `LLAMA` | `llama` | `<\|eot_id\|>`, `<\|end_of_text\|>` | ❌ |
 | `MISTRAL` | `mistral`, `mixtral` | `</s>`, `[INST]` | ❌ |
 | `QWEN` | `qwen` | `<\|im_end\|>` | ✅ |
-| `DEEPSEEK` | `deepseek` | `<\u2514\u2518>`, `<\|end_of_sentence\|>` | ✅ |
+| `DEEPSEEK` | `deepseek` | `<└┘>`, `<\|end_of_sentence\|>` | ✅ |
 | `PHI` | `phi` | `<\|end\|>` | ❌ |
 | `UNKNOWN` | anything else | *(GGUF-embedded EOS)* | ❌ |
 
@@ -249,7 +250,7 @@ When a user asks the bot to search for something, it:
 4. Passes up to `SEARCH_FETCH_CHARS` characters (default 1500) of clean text per page to the LLM
 5. The LLM **summarises the actual page content** and returns a response with source links
 
-Pages that time out, return errors, or are on the skip list (YouTube, Twitter/X, Instagram, TikTok, Facebook) are silently skipped and fall back to the Brave index description.
+Raw PDF file URLs (those ending in `.pdf`) are skipped automatically. Pages that time out, return errors, or are on the skip list (YouTube, Twitter/X, Instagram, TikTok, Facebook) are silently skipped and fall back to the Brave index description. Tool results are capped at 4000 characters before being injected into the context window to prevent runaway responses from exhausting model RAM.
 
 ### Search tuning
 
@@ -297,15 +298,20 @@ Users interact via DM commands:
 To schedule a job, just ask the bot naturally:
 > "Remind me every morning at 8am to review my task list"
 
+Cron expressions are validated before registration — invalid field ranges and extra fields are rejected with a clear error message. Per-user and global job limits are enforced atomically to prevent race conditions.
+
 ---
 
 ## Security Notes
 
 - The bot is designed for **personal/trusted-user use**. All user messages are stored in SQLite and logged to an audit file.
-- Per-user rate limiting (`RATE_LIMIT_SECONDS`, default 5s) prevents inference spam.
+- Per-user rate limiting (`RATE_LIMIT_SECONDS`, default 5s) prevents inference spam. The rate-limit table is periodically compacted so it does not grow unboundedly.
 - Input length is capped at `MAX_INPUT_LENGTH` characters (default 1000) before hitting the LLM.
-- Scheduler jobs are capped per user (`SCHEDULER_MAX_JOBS_PER_USER`, default 5).
-- The audit log at `AUDIT_LOG_PATH` records all interactions for review.
+- Tool results are capped at 4000 characters before context injection to prevent memory exhaustion.
+- Scheduler jobs are capped per user (`SCHEDULER_MAX_JOBS_PER_USER`, default 5) with an atomic DB check to prevent races.
+- Cron expressions supplied by the LLM are validated against legal field ranges before being passed to APScheduler.
+- Timezone strings are validated against the IANA `zoneinfo` database before being stored.
+- The audit log at `AUDIT_LOG_PATH` records all interactions for review. Timeout responses are recorded distinctly from genuine LLM replies.
 
 ---
 
