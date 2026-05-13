@@ -5,42 +5,60 @@ import asyncio
 import json
 import logging
 import re
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from localbot.adapters.llamacpp_client import LlamaCppClient
 from localbot.adapters.llamacpp_server import LlamaCppServer
 from localbot.config import cfg
 from localbot.storage.audit import log_event
 from localbot.storage.history import append_message, get_history
-from localbot.tools.registry import TOOL_SCHEMAS, dispatch
+from localbot.tools.registry import build_tool_schemas, dispatch
+
+if TYPE_CHECKING:
+    from localbot.scheduler.service import SchedulerService
 
 log = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """\
-You are a helpful, concise assistant. You have three tools:
+You are a helpful, concise assistant. You have the following tools:
+
+SEARCH & TIME:
 - web_search(query) — search the web for current information
 - reddit_search(query, subreddit?) — search Reddit posts
 - get_current_time(timezone?) — get the current date and time
 
+SCHEDULING:
+- schedule_job(prompt, cron_expr) — create a recurring scheduled message
+- cancel_job(job_id) — cancel a scheduled job by its ID
+- list_jobs() — list all active scheduled jobs for the user
+
 RULES:
-1. When the user asks you to search, look something up, or find current news —
-   you MUST call the tool immediately. Do NOT describe what you will do.
-   Do NOT say "I will search". Do NOT fabricate results or use placeholders.
-   Just call the tool.
-2. After receiving tool results, write a clear, concise summary with source links.
-3. For casual conversation, greetings, or simple questions you can answer from
-   knowledge — respond directly without calling any tools.
-4. Never call the same tool with the same arguments twice in one turn.
-5. Keep responses concise and friendly.
+1. When the user asks to search, look something up, or find current news —
+   call the tool immediately. Do NOT describe what you will do.
+2. When the user asks to be reminded or wants a recurring message —
+   call schedule_job immediately. Convert their natural-language schedule
+   into a 5-field cron expression (minute hour day month day_of_week).
+   Examples:
+     "every day at 8am"          → cron_expr="0 8 * * *"
+     "every Monday at 9am"       → cron_expr="0 9 * * 1"
+     "every weekday at 6pm"      → cron_expr="0 18 * * 1-5"
+     "every hour"                → cron_expr="0 * * * *"
+     "every 30 minutes"          → cron_expr="*/30 * * * *"
+   The user's timezone (if set) is used by the server; always express
+   times in the user's local timezone when converting.
+3. NEVER confirm a job is scheduled unless schedule_job returned successfully.
+   NEVER invent a job ID. Always relay the ID returned by the tool.
+4. After receiving tool results, write a clear, concise summary.
+5. For casual conversation or simple questions — respond directly.
+6. Never call the same tool with the same arguments twice in one turn.
+7. Keep responses concise and friendly.
 """
 
-# Fix #17: structural echo detection — markers are tied to the shape of the
-# system prompt, not arbitrary phrases that silently rot when the prompt changes.
 _SYSTEM_ECHO_MARKERS = (
     "you are a helpful, concise assistant",
     "rules:",
-    "1. when the user asks you to search",
-    "you must call the tool immediately",
+    "1. when the user asks to search",
+    "call the tool immediately",
 )
 
 _CONVERSATIONAL = re.compile(
@@ -56,41 +74,61 @@ _SEARCH_INTENT = re.compile(
     re.IGNORECASE,
 )
 
-# Fix #10: cap how many characters of a tool result are injected into the
-# context window to prevent runaway search responses from exhausting model RAM.
+_SCHEDULE_INTENT = re.compile(
+    r"\b(remind|reminder|schedule|recurring|every (day|week|hour|morning|evening|night|"
+    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|weekday|weekend|"
+    r"\d+ (minute|hour|day)s?)|at \d+(am|pm|:\d+))",
+    re.IGNORECASE,
+)
+
+_CANCEL_INTENT = re.compile(
+    r"\b(cancel|remove|delete|stop|unschedule)\b.*\b(job|reminder|schedule)",
+    re.IGNORECASE,
+)
+
 _TOOL_RESULT_MAX_CHARS = 4000
 
 
-def _needs_tools(message: str, history: list[dict[str, Any]]) -> bool:
+def _needs_tools(
+    message: str,
+    history: list[dict[str, Any]],
+    has_scheduler: bool = False,
+) -> bool:
     """Return True if this turn should have tools available."""
     stripped = message.strip()
     if _SEARCH_INTENT.search(stripped):
         return True
+    if has_scheduler and (
+        _SCHEDULE_INTENT.search(stripped) or _CANCEL_INTENT.search(stripped)
+    ):
+        return True
     for turn in reversed(history[-4:]):
         if turn.get("role") == "assistant":
-            content = turn.get("content") or ""
-            if _SEARCH_INTENT.search(content):
+            if _SEARCH_INTENT.search(turn.get("content") or ""):
                 return True
             break
     return not bool(_CONVERSATIONAL.fullmatch(stripped))
 
 
 def _is_system_echo(content: str) -> bool:
-    """Return True if the model echoed the system prompt as its reply.
-
-    Fix #17: checks structural markers coupled to the prompt shape rather
-    than hardcoded phrases that silently stop working if the prompt changes.
-    """
     lower = content.lower().strip()
     return any(marker in lower[:300] for marker in _SYSTEM_ECHO_MARKERS)
 
 
 class Agent:
-    def __init__(self, server: LlamaCppServer, client: LlamaCppClient) -> None:
+    def __init__(
+        self,
+        server: LlamaCppServer,
+        client: LlamaCppClient,
+        scheduler: "SchedulerService | None" = None,
+    ) -> None:
         self._server = server
         self._client = client
+        self._scheduler = scheduler
 
     async def handle(self, user_id: str, user_message: str) -> str:
+        from localbot.tools.scheduler_tools import SchedulerTools
+
         await self._server.ensure_running()
         await self._client.wait_until_ready(retries=10, delay=1.0)
 
@@ -103,19 +141,26 @@ class Agent:
 
         log_event("user_message", user_id=user_id, content=user_message)
 
-        # Fix #2: define the timeout sentinel so we can distinguish it from a
-        # real LLM reply when deciding whether to persist history.
+        # Build per-request scheduler tools bound to this user_id.
+        sched_tools = (
+            SchedulerTools(self._scheduler, user_id)
+            if self._scheduler is not None
+            else None
+        )
+        has_scheduler = sched_tools is not None
+
         timeout_sentinel = "Sorry, your request took too long and was cancelled."
         reply = timeout_sentinel
         try:
             async with asyncio.timeout(cfg.request_deadline_seconds):
-                tools = TOOL_SCHEMAS if _needs_tools(user_message, history) else None
-                reply = await self._run_loop(messages, tools)
+                if _needs_tools(user_message, history, has_scheduler=has_scheduler):
+                    tools = build_tool_schemas(include_scheduler=has_scheduler)
+                else:
+                    tools = None
+                reply = await self._run_loop(messages, tools, sched_tools)
         except asyncio.TimeoutError:
-            pass  # reply stays as timeout_sentinel
+            pass
 
-        # Fix #2: audit log is always written (including timeouts), but history
-        # is only persisted for genuine LLM replies, not timeout messages.
         log_event("assistant_reply", user_id=user_id, content=reply)
         if reply and reply != timeout_sentinel:
             append_message(user_id, "user", user_message)
@@ -124,9 +169,11 @@ class Agent:
         return reply
 
     async def _run_loop(
-        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        sched_tools: Any = None,
     ) -> str:
-        """Tool loop. messages is local-only — tool turns are never written to history."""
         called: set[tuple[str, str]] = set()
 
         for iteration in range(cfg.max_tool_iterations + 1):
@@ -180,10 +227,9 @@ class Agent:
 
                 log.info("Tool call: %s(%s)", name, args)
                 log_event("tool_call", tool=name, args=args)
-                result = await dispatch(name, args)
+                result = await dispatch(name, args, scheduler_tools=sched_tools)
                 log_event("tool_result", tool=name, result=result[:500])
 
-                # Fix #10: cap tool result length before injecting into context.
                 if len(result) > _TOOL_RESULT_MAX_CHARS:
                     log.debug(
                         "Tool result from %s truncated from %d to %d chars",
