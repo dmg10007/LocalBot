@@ -3,17 +3,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from localbot.config import cfg
 from localbot.tools import search, reddit, time_tools
+from localbot.tools.scheduler_tools import SCHEDULER_TOOL_SCHEMAS
+
+if TYPE_CHECKING:
+    from localbot.tools.scheduler_tools import SchedulerTools
 
 log = logging.getLogger(__name__)
 
-# OpenAI-style tool schemas sent to the model.
+# Static schemas for search / time tools.
 # Descriptions are intentionally narrow — small models over-call tools
-# when descriptions are broad. "Use for X" should mean "only use for X".
-TOOL_SCHEMAS: list[dict[str, Any]] = [
+# when descriptions are broad.
+_STATIC_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
@@ -74,11 +78,43 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
 ]
 
+# Backwards-compatible alias: static tools only (no scheduler).
+# Used in contexts where no SchedulerService is available.
+TOOL_SCHEMAS = _STATIC_SCHEMAS
 
-async def dispatch(tool_name: str, args: dict[str, Any]) -> str:
-    """Run a tool by name and return its string result."""
+
+def build_tool_schemas(include_scheduler: bool = False) -> list[dict[str, Any]]:
+    """Return the full list of tool schemas for a request.
+
+    Args:
+        include_scheduler: Whether to include schedule_job / cancel_job /
+            list_jobs schemas. Pass True when a live SchedulerService is
+            available for this request.
+    """
+    if include_scheduler:
+        return _STATIC_SCHEMAS + SCHEDULER_TOOL_SCHEMAS
+    return _STATIC_SCHEMAS
+
+
+async def dispatch(
+    tool_name: str,
+    args: dict[str, Any],
+    scheduler_tools: "SchedulerTools | None" = None,
+) -> str:
+    """Run a tool by name and return its string result.
+
+    Scheduler tools are routed to *scheduler_tools* when provided; all
+    other tools are handled inline here.
+    """
     try:
         async with asyncio.timeout(cfg.tool_timeout_seconds):
+            # Scheduler tools: delegate to the per-request SchedulerTools instance.
+            if scheduler_tools is not None:
+                result = await scheduler_tools.dispatch(tool_name, args)
+                if result is not None:
+                    return result
+
+            # Static tools.
             if tool_name == "web_search":
                 return await search.web_search(args["query"])
             elif tool_name == "reddit_search":

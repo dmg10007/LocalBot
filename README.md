@@ -7,7 +7,7 @@ A lightweight Discord DM bot that runs a local LLM via [llama.cpp](https://githu
 - **Conversational chat** with per-user message history (SQLite-backed)
 - **Deep web search** via Brave Search API — fetches and summarises actual page content, not just index snippets
 - **Reddit search** — searches Reddit posts and discussions via the unauthenticated JSON API
-- **Scheduled prompts** — users define recurring jobs with natural-language requests; validated cron expressions prevent abuse
+- **Scheduled prompts** — users define recurring jobs via natural language; the LLM converts schedules to cron expressions and calls `schedule_job` directly; commands (`jobs list`, `jobs cancel <id>`) are also available
 - **Model-agnostic inference** — auto-detects model family once on startup; swap models by changing one line in `.env`
 - **Thinking model support** — automatically strips `<think>` blocks for reasoning models (Gemma, DeepSeek, Qwen)
 - **Rate limiting** — per-user cooldown with bounded memory (stale entries are automatically evicted)
@@ -179,14 +179,15 @@ python -m localbot
 ```
 src/localbot/
 ├── __main__.py             # `python -m localbot` entry point
-├── app.py                  # Discord event loop + rate limiting
+├── app.py                  # Discord event loop, rate limiting, command handler
 ├── config.py               # All settings loaded from .env
 ├── agent.py                # Core request/tool loop
 ├── adapters/
 │   ├── llamacpp_server.py  # llama-server subprocess manager + log capture
 │   └── llamacpp_client.py  # OpenAI-compatible HTTP client, model detection, think-strip
 ├── tools/
-│   ├── registry.py         # Tool schemas + dispatcher
+│   ├── registry.py         # Tool schemas + dispatcher (static + scheduler)
+│   ├── scheduler_tools.py  # LLM-callable schedule_job / cancel_job / list_jobs wrappers
 │   ├── search.py           # Brave Search + page fetch & summarise
 │   ├── reddit.py           # Reddit JSON API (no auth required)
 │   └── time_tools.py       # Current time / timezone helpers
@@ -285,7 +286,19 @@ LLAMA_SERVER_EXTRA_ARGS=--reasoning-budget 512
 
 ## Scheduled Jobs
 
-Users interact via DM commands:
+Users can schedule recurring prompts in two ways:
+
+### Natural language (via the LLM)
+
+Just ask the bot conversationally. The LLM translates the request into a cron expression and calls `schedule_job` directly — no special syntax required:
+
+> *"Remind me every morning at 8am to review my task list"*
+> *"Send me the latest tech news every weekday at 6pm"*
+> *"Check in with me every Monday at 9am"*
+
+The bot will **only confirm a job once `schedule_job` has returned successfully** and will always relay the real job ID. It will never invent an ID or confirm a job it hasn't actually created.
+
+### Direct commands
 
 | Command | Description |
 |---|---|
@@ -294,9 +307,6 @@ Users interact via DM commands:
 | `timezone set <IANA>` | Set your local timezone (e.g. `America/New_York`) |
 | `timezone show` | Show your saved timezone |
 | `time now` | Show the current time in your timezone |
-
-To schedule a job, just ask the bot naturally:
-> "Remind me every morning at 8am to review my task list"
 
 Cron expressions are validated before registration — invalid field ranges and extra fields are rejected with a clear error message. Per-user and global job limits are enforced atomically to prevent race conditions.
 
@@ -312,6 +322,7 @@ Cron expressions are validated before registration — invalid field ranges and 
 - Cron expressions supplied by the LLM are validated against legal field ranges before being passed to APScheduler.
 - Timezone strings are validated against the IANA `zoneinfo` database before being stored.
 - The audit log at `AUDIT_LOG_PATH` records all interactions for review. Timeout responses are recorded distinctly from genuine LLM replies.
+- Scheduler tool calls (`schedule_job`, `cancel_job`, `list_jobs`) are scoped per-request to the authenticated user — the LLM cannot create or cancel jobs for other users.
 
 ---
 

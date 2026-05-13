@@ -33,13 +33,12 @@ class LocalBot(discord.Client):
 
         self._server = LlamaCppServer()
         self._client = LlamaCppClient()
-        self._agent = Agent(self._server, self._client)
         self._scheduler = SchedulerService(self._send_scheduled)
+        # Pass the live SchedulerService into Agent so the LLM can actually
+        # create, cancel, and list jobs via tool calls.
+        self._agent = Agent(self._server, self._client, scheduler=self._scheduler)
         self._backend_ready = False
-        # Fix #14: plain dict instead of defaultdict; stale entries are evicted
-        # periodically in _evict_stale_rate_limit_entries() to cap memory use.
         self._last_request: dict[str, float] = {}
-        # Fix #3: store the task reference so exceptions are never silently lost.
         self._backend_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------
@@ -48,13 +47,10 @@ class LocalBot(discord.Client):
 
     async def on_ready(self) -> None:
         log.info("Logged in as %s (id=%s)", self.user, self.user.id if self.user else "?")
-        # Fix #3: track the task and attach a done-callback so any unhandled
-        # exception in _start_backend is logged rather than silently discarded.
         self._backend_task = asyncio.create_task(self._start_backend())
         self._backend_task.add_done_callback(self._on_backend_task_done)
 
     def _on_backend_task_done(self, task: asyncio.Task) -> None:
-        """Log any exception raised by the backend startup task."""
         if not task.cancelled() and task.exception() is not None:
             log.exception(
                 "Backend startup task failed unexpectedly",
@@ -93,7 +89,6 @@ class LocalBot(discord.Client):
             )
             return
 
-        # Fix #14: evict stale entries before checking to keep the dict bounded.
         now = time.monotonic()
         self._evict_stale_rate_limit_entries(now)
         last = self._last_request.get(user_id, 0.0)
@@ -112,7 +107,6 @@ class LocalBot(discord.Client):
             await message.channel.send(chunk)
 
     def _evict_stale_rate_limit_entries(self, now: float) -> None:
-        """Remove entries well past the rate-limit window to cap memory use."""
         cutoff = now - cfg.rate_limit_seconds * 10
         stale = [uid for uid, ts in self._last_request.items() if ts < cutoff]
         for uid in stale:
@@ -121,7 +115,6 @@ class LocalBot(discord.Client):
     async def close(self) -> None:
         self._scheduler.stop()
         await self._client.close()
-        # Fix #5: close shared aiohttp sessions used by the tool modules.
         await search_module.close_session()
         await reddit_module.close_session()
         await self._server.stop()
@@ -155,7 +148,6 @@ class LocalBot(discord.Client):
         m = re.match(r"^timezone set (.+)$", text, re.IGNORECASE)
         if m:
             tz = m.group(1).strip()
-            # Fix #7: validate the timezone before storing; give a friendly error.
             if tz not in zoneinfo.available_timezones():
                 await message.channel.send(
                     f"Unknown timezone `{tz}`. Use an IANA name like `America/New_York`."
