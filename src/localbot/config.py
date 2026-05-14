@@ -55,7 +55,9 @@ class Config:
     database_path: str = field(default_factory=lambda: _get("DATABASE_PATH", "storage/localbot.sqlite3"))
     audit_log_path: str = field(default_factory=lambda: _get("AUDIT_LOG_PATH", "logs/audit.jsonl"))
 
-    scheduler_poll_seconds: int = field(default_factory=lambda: _get_int("SCHEDULER_POLL_SECONDS", 15))
+    # Fix #5: removed scheduler_poll_seconds — APScheduler's AsyncIOScheduler
+    # schedules callbacks directly on the asyncio event loop and does not use
+    # a poll interval. This field was dead config left over from an older design.
     scheduler_max_jobs: int = field(default_factory=lambda: _get_int("SCHEDULER_MAX_JOBS", 20))
     scheduler_max_jobs_per_user: int = field(default_factory=lambda: _get_int("SCHEDULER_MAX_JOBS_PER_USER", 5))
 

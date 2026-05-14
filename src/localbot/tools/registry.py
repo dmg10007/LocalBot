@@ -78,9 +78,8 @@ _STATIC_SCHEMAS: list[dict[str, Any]] = [
     },
 ]
 
-# Backwards-compatible alias: static tools only (no scheduler).
-# Used in contexts where no SchedulerService is available.
-TOOL_SCHEMAS = _STATIC_SCHEMAS
+# Fix #6: removed dead TOOL_SCHEMAS alias — it was never imported anywhere
+# after build_tool_schemas() replaced it.
 
 
 def build_tool_schemas(include_scheduler: bool = False) -> list[dict[str, Any]]:

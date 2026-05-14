@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import re
 from typing import Any
@@ -26,9 +27,9 @@ _FETCH_UA = (
 )
 
 # Domains that reliably block scrapers or return useless content.
-# Fix #9: "pdf" is removed from this set — it was matching any URL containing
-# the substring "pdf" (e.g. /pdf-guide/). PDF files are now detected in
-# _should_skip() via an endswith() check on the path instead.
+# Fix #9 (prior): "pdf" removed from this set — it was matching any URL
+# containing the substring "pdf". PDF files are detected in _should_skip()
+# via an endswith() check on the path instead.
 _SKIP_DOMAINS = frozenset([
     "youtube.com", "youtu.be",
     "twitter.com", "x.com",
@@ -55,8 +56,8 @@ async def close_session() -> None:
 def _should_skip(url: str) -> bool:
     """Return True for URLs we know won't yield useful scraped text."""
     lower = url.lower()
-    # Fix #9: detect raw PDF URLs by checking the path extension, not by
-    # substring matching which incorrectly skips /pdf-guide/, pdfhost.io, etc.
+    # Detect raw PDF URLs by checking the path extension, not by substring
+    # matching which incorrectly skips /pdf-guide/, pdfhost.io, etc.
     path = lower.split("?")[0]  # strip query string before checking extension
     if path.endswith(".pdf"):
         return True
@@ -146,16 +147,17 @@ async def web_search(query: str) -> str:
         return_exceptions=False,
     )
 
+    # Fix #9: use zip_longest to pair results with their fetched text without
+    # fragile manual index arithmetic. Results beyond fetch_targets get None.
     lines: list[str] = []
-    for i, r in enumerate(top, 1):
+    for i, (r, page_content) in enumerate(
+        itertools.zip_longest(top, page_texts, fillvalue=None), 1
+    ):
+        if r is None:
+            break
         title = r.get("title", "")
         url = r.get("url", "")
         description = r.get("description", "")
-
-        fetched_idx = i - 1
-        page_content: str | None = None
-        if fetched_idx < len(page_texts) and page_texts[fetched_idx]:
-            page_content = page_texts[fetched_idx]  # type: ignore[assignment]
 
         block = f"{i}. **{title}**\n   {url}"
         if page_content:

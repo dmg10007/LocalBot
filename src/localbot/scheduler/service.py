@@ -9,6 +9,7 @@ import zoneinfo
 from typing import Callable, Awaitable
 
 from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED
+from apscheduler.jobstores.base import JobLookupError
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -50,8 +51,6 @@ class SchedulerService:
         self._scheduler = AsyncIOScheduler()
 
     def start(self) -> None:
-        # Use imported constants instead of magic numbers.
-        # Also listen for EVENT_JOB_MISSED so silent misfires are logged.
         self._scheduler.add_listener(
             self._on_job_event,
             EVENT_JOB_ERROR | EVENT_JOB_MISSED,
@@ -101,13 +100,6 @@ class SchedulerService:
             )
             tz = zoneinfo.ZoneInfo("UTC")
 
-        # Bug fix #1: APScheduler 3.x does not reliably await async bound
-        # methods — asyncio.iscoroutinefunction() returns False for them in
-        # several Python/APScheduler version combos, so the coroutine was
-        # never awaited and the job silently did nothing.
-        #
-        # Fix: register a plain synchronous callback (_fire_sync) that
-        # schedules the coroutine on the running event loop via create_task.
         self._scheduler.add_job(
             self._fire_sync,
             CronTrigger(
@@ -130,12 +122,13 @@ class SchedulerService:
     def _fire_sync(self, user_id: str, prompt: str) -> None:
         """Synchronous APScheduler callback.
 
-        Schedules _fire on the running event loop via create_task so the
-        coroutine is properly awaited without relying on APScheduler's
-        async detection of bound methods.
+        Fix #2: use get_running_loop() instead of get_event_loop().
+        get_event_loop() is deprecated in Python 3.10+ and will raise
+        RuntimeError in a future version when no current loop exists in the
+        calling thread. get_running_loop() raises RuntimeError immediately if
+        called outside a running loop, making misconfiguration loudly visible.
         """
-        loop = asyncio.get_event_loop()
-        loop.create_task(
+        asyncio.get_running_loop().create_task(
             self._fire(user_id, prompt),
             name=f"scheduler-fire-{user_id}",
         )
@@ -161,9 +154,8 @@ class SchedulerService:
         if user_total >= cfg.scheduler_max_jobs_per_user:
             raise ValueError("Per-user job limit reached.")
 
-        # Bug fix #4: snapshot the user's timezone at creation time so that
-        # later changes to user_settings do not silently shift existing jobs,
-        # and so restarts re-register with the originally-intended timezone.
+        # Snapshot the user's timezone at creation time so that later changes
+        # to user_settings do not silently shift existing jobs.
         timezone = get_user_timezone(user_id)
 
         job = Job(
@@ -182,10 +174,13 @@ class SchedulerService:
         return job
 
     def cancel_job(self, job_id: str) -> bool:
+        # Fix #11: catch only JobLookupError (job not found in scheduler)
+        # instead of bare Exception, which would swallow genuine errors like
+        # the scheduler not being started.
         try:
             self._scheduler.remove_job(job_id)
-        except Exception:
-            pass
+        except JobLookupError:
+            pass  # job already removed or was never registered in this session
         return delete_job(job_id)
 
     def list_user_jobs(self, user_id: str) -> list[Job]:
