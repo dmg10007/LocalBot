@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import re
+from typing import Any
 
 import aiohttp
 
@@ -36,13 +37,14 @@ def _clean_subreddit(subreddit: str) -> str:
 
 
 async def reddit_search(query: str, subreddit: str | None = None) -> str:
+    # Fix #13: use dict[str, Any] instead of bare dict.
     if subreddit:
         subreddit = _clean_subreddit(subreddit)
         url = f"https://www.reddit.com/r/{subreddit}/search.json"
-        params: dict = {"q": query, "restrict_sr": "1", "sort": "relevance", "limit": cfg.search_result_count}
+        params: dict[str, Any] = {"q": query, "restrict_sr": "1", "sort": "relevance", "limit": cfg.search_result_count}
     else:
         url = "https://www.reddit.com/search.json"
-        params = {"q": query, "sort": "relevance", "limit": cfg.search_result_count}
+        params: dict[str, Any] = {"q": query, "sort": "relevance", "limit": cfg.search_result_count}
 
     headers = {"User-Agent": "LocalBot/0.1"}
     session = _get_session()

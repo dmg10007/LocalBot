@@ -45,7 +45,7 @@ _STOP_TOKENS: dict[ModelFamily, list[str]] = {
     ModelFamily.LLAMA:    ["<|eot_id|>", "<|end_of_text|>", "<|eom_id|>"],
     ModelFamily.MISTRAL:  ["</s>", "[INST]"],
     ModelFamily.QWEN:     ["<|im_end|>", "<|endoftext|>"],
-    ModelFamily.DEEPSEEK: ["<└┘>", "<|end_of_sentence|>"],
+    ModelFamily.DEEPSEEK: ["<\u2514\u2518>", "<|end_of_sentence|>"],
     ModelFamily.PHI:      ["<|end|>", "<|endoftext|>"],
     ModelFamily.UNKNOWN:  [],
 }
@@ -89,6 +89,15 @@ class LlamaCppClient:
         self._session: aiohttp.ClientSession | None = None
         self._family: ModelFamily = ModelFamily.UNKNOWN
         self._model_name: str = "unknown"
+        # Fix #10: tracks whether the server has been confirmed healthy and
+        # model detection has run. Checked in Agent.handle() to skip
+        # wait_until_ready() on every message once the server is up.
+        self._is_ready: bool = False
+
+    @property
+    def is_ready(self) -> bool:
+        """True once the server has passed a health check and model detection."""
+        return self._is_ready
 
     def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -199,10 +208,11 @@ class LlamaCppClient:
                 ) as r:
                     if r.status == 200:
                         log.info("llama-server is ready")
-                        # Fix #13: detect_model only needs to run once — skip
-                        # subsequent calls once the family has been identified.
                         if self._family is ModelFamily.UNKNOWN:
                             await self.detect_model()
+                        # Fix #10: mark the client as ready so Agent.handle()
+                        # can skip this probe on subsequent requests.
+                        self._is_ready = True
                         return
             except Exception:
                 pass

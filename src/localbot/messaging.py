@@ -7,9 +7,17 @@ DISCORD_MAX = 2000
 def split_message(text: str, limit: int = DISCORD_MAX) -> list[str]:
     """Split a long string into chunks that fit within Discord's message limit.
 
-    Fix #15: consume only the single newline at the split boundary rather than
-    all leading newlines, so blank lines inside markdown code blocks are kept.
+    Fix #14: guard against empty string — Discord rejects empty messages with
+    a 400 Bad Request. Returns an empty list so the caller sends nothing.
+
+    Fix #15 (prior): consume only the single newline at the split boundary
+    rather than all leading newlines, so blank lines inside markdown code
+    blocks are kept.
     """
+    # Fix #14: empty or whitespace-only input should never be sent to Discord.
+    if not text or not text.strip():
+        return []
+
     if len(text) <= limit:
         return [text]
 

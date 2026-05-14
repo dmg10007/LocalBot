@@ -13,6 +13,8 @@ from localbot.config import cfg
 from localbot.storage.audit import log_event
 from localbot.storage.history import append_message, get_history
 from localbot.tools.registry import build_tool_schemas, dispatch
+# Fix #4: moved from inside handle() — no circular import exists here.
+from localbot.tools.scheduler_tools import SchedulerTools
 
 if TYPE_CHECKING:
     from localbot.scheduler.service import SchedulerService
@@ -102,9 +104,16 @@ def _needs_tools(
         _SCHEDULE_INTENT.search(stripped) or _CANCEL_INTENT.search(stripped)
     ):
         return True
+    # Fix #7: check all three intents against the most recent assistant turn,
+    # not just search — so follow-ups like "actually cancel that" get tools.
     for turn in reversed(history[-4:]):
         if turn.get("role") == "assistant":
-            if _SEARCH_INTENT.search(turn.get("content") or ""):
+            content = turn.get("content") or ""
+            if _SEARCH_INTENT.search(content):
+                return True
+            if has_scheduler and (
+                _SCHEDULE_INTENT.search(content) or _CANCEL_INTENT.search(content)
+            ):
                 return True
             break
     return not bool(_CONVERSATIONAL.fullmatch(stripped))
@@ -127,10 +136,13 @@ class Agent:
         self._scheduler = scheduler
 
     async def handle(self, user_id: str, user_message: str) -> str:
-        from localbot.tools.scheduler_tools import SchedulerTools
-
         await self._server.ensure_running()
-        await self._client.wait_until_ready(retries=10, delay=1.0)
+        # Fix #10: only call wait_until_ready when the client is not yet ready;
+        # avoids an unnecessary /health HTTP probe on every message once the
+        # server is up. LlamaCppClient.is_ready is set after the first
+        # successful health check.
+        if not self._client.is_ready:
+            await self._client.wait_until_ready(retries=10, delay=1.0)
 
         history = get_history(user_id)
         messages: list[dict[str, Any]] = [
