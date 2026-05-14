@@ -43,7 +43,19 @@ def init_db() -> None:
                 user_id     TEXT NOT NULL,
                 prompt      TEXT NOT NULL,
                 cron_expr   TEXT NOT NULL,
+                timezone    TEXT NOT NULL DEFAULT 'UTC',
                 created_at  REAL NOT NULL DEFAULT (unixepoch('now'))
             );
         """)
+
+        # Non-destructive migration: add timezone column to existing databases
+        # that were created before this column existed.  ALTER TABLE ADD COLUMN
+        # is a no-op if the column is already present (caught below).
+        try:
+            con.execute(
+                "ALTER TABLE scheduled_jobs ADD COLUMN timezone TEXT NOT NULL DEFAULT 'UTC'"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
     con.close()
