@@ -13,7 +13,6 @@ from localbot.config import cfg
 from localbot.storage.audit import log_event
 from localbot.storage.history import append_message, get_history
 from localbot.tools.registry import build_tool_schemas, dispatch
-# Fix #4: moved from inside handle() — no circular import exists here.
 from localbot.tools.scheduler_tools import SchedulerTools
 
 if TYPE_CHECKING:
@@ -28,6 +27,10 @@ SEARCH & TIME:
 - web_search(query) — search the web for current information
 - reddit_search(query, subreddit?) — search Reddit posts
 - get_current_time(timezone?) — get the current date and time
+
+DIAGNOSTICS:
+- read_logs(level?, limit?) — read recent audit log entries to diagnose
+  errors, failed jobs, timeouts, or unexpected behaviour
 
 SCHEDULING:
 - schedule_job(prompt, cron_expr) — create a recurring scheduled message
@@ -54,6 +57,8 @@ RULES:
 5. For casual conversation or simple questions — respond directly.
 6. Never call the same tool with the same arguments twice in one turn.
 7. Keep responses concise and friendly.
+8. When the user asks to check logs, troubleshoot an issue, or asks why
+   something went wrong — call read_logs immediately.
 """
 
 _SYSTEM_ECHO_MARKERS = (
@@ -88,6 +93,13 @@ _CANCEL_INTENT = re.compile(
     re.IGNORECASE,
 )
 
+_DIAGNOSTIC_INTENT = re.compile(
+    r"\b(log|logs|error|errors|crash|crashed|fail|failed|broke|broken|"
+    r"why did|debug|diagnos|troubleshoot|something wrong|not working|"
+    r"what happened|check the logs)",
+    re.IGNORECASE,
+)
+
 _TOOL_RESULT_MAX_CHARS = 4000
 
 
@@ -100,12 +112,12 @@ def _needs_tools(
     stripped = message.strip()
     if _SEARCH_INTENT.search(stripped):
         return True
+    if _DIAGNOSTIC_INTENT.search(stripped):
+        return True
     if has_scheduler and (
         _SCHEDULE_INTENT.search(stripped) or _CANCEL_INTENT.search(stripped)
     ):
         return True
-    # Fix #7: check all three intents against the most recent assistant turn,
-    # not just search — so follow-ups like "actually cancel that" get tools.
     for turn in reversed(history[-4:]):
         if turn.get("role") == "assistant":
             content = turn.get("content") or ""
@@ -137,10 +149,6 @@ class Agent:
 
     async def handle(self, user_id: str, user_message: str) -> str:
         await self._server.ensure_running()
-        # Fix #10: only call wait_until_ready when the client is not yet ready;
-        # avoids an unnecessary /health HTTP probe on every message once the
-        # server is up. LlamaCppClient.is_ready is set after the first
-        # successful health check.
         if not self._client.is_ready:
             await self._client.wait_until_ready(retries=10, delay=1.0)
 
@@ -153,7 +161,6 @@ class Agent:
 
         log_event("user_message", user_id=user_id, content=user_message)
 
-        # Build per-request scheduler tools bound to this user_id.
         sched_tools = (
             SchedulerTools(self._scheduler, user_id)
             if self._scheduler is not None
@@ -169,7 +176,9 @@ class Agent:
                     tools = build_tool_schemas(include_scheduler=has_scheduler)
                 else:
                     tools = None
-                reply = await self._run_loop(messages, tools, sched_tools)
+                reply = await self._run_loop(
+                    messages, tools, sched_tools, requesting_user_id=user_id
+                )
         except asyncio.TimeoutError:
             pass
 
@@ -185,6 +194,7 @@ class Agent:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         sched_tools: Any = None,
+        requesting_user_id: str = "",
     ) -> str:
         called: set[tuple[str, str]] = set()
 
@@ -239,7 +249,12 @@ class Agent:
 
                 log.info("Tool call: %s(%s)", name, args)
                 log_event("tool_call", tool=name, args=args)
-                result = await dispatch(name, args, scheduler_tools=sched_tools)
+                result = await dispatch(
+                    name,
+                    args,
+                    scheduler_tools=sched_tools,
+                    requesting_user_id=requesting_user_id,
+                )
                 log_event("tool_result", tool=name, result=result[:500])
 
                 if len(result) > _TOOL_RESULT_MAX_CHARS:

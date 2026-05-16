@@ -7,6 +7,7 @@ from typing import Any, TYPE_CHECKING
 
 from localbot.config import cfg
 from localbot.tools import search, reddit, time_tools
+from localbot.tools.log_reader import read_logs
 from localbot.tools.scheduler_tools import SCHEDULER_TOOL_SCHEMAS
 
 if TYPE_CHECKING:
@@ -14,7 +15,7 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-# Static schemas for search / time tools.
+# Static schemas for search / time / diagnostics tools.
 # Descriptions are intentionally narrow — small models over-call tools
 # when descriptions are broad.
 _STATIC_SCHEMAS: list[dict[str, Any]] = [
@@ -76,10 +77,34 @@ _STATIC_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_logs",
+            "description": (
+                "Read recent audit log entries to diagnose errors, failed scheduled "
+                "jobs, timeouts, or unexpected bot behaviour. Only call this when "
+                "the user explicitly asks to check logs, troubleshoot an issue, or "
+                "find out why something went wrong."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "level": {
+                        "type": "string",
+                        "enum": ["DEBUG", "INFO", "WARNING", "ERROR"],
+                        "description": "Filter by severity. Omit to return all levels.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of entries to return (default 50, max 200).",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
 ]
-
-# Fix #6: removed dead TOOL_SCHEMAS alias — it was never imported anywhere
-# after build_tool_schemas() replaced it.
 
 
 def build_tool_schemas(include_scheduler: bool = False) -> list[dict[str, Any]]:
@@ -99,11 +124,19 @@ async def dispatch(
     tool_name: str,
     args: dict[str, Any],
     scheduler_tools: "SchedulerTools | None" = None,
+    requesting_user_id: str = "",
 ) -> str:
     """Run a tool by name and return its string result.
 
     Scheduler tools are routed to *scheduler_tools* when provided; all
     other tools are handled inline here.
+
+    Args:
+        tool_name: Name of the tool to invoke.
+        args: Parsed JSON arguments from the LLM tool call.
+        scheduler_tools: Per-request scheduler tool instance, if available.
+        requesting_user_id: Discord user ID of the requester.  Required
+            for read_logs scope enforcement.
     """
     try:
         async with asyncio.timeout(cfg.tool_timeout_seconds):
@@ -122,6 +155,12 @@ async def dispatch(
                 )
             elif tool_name == "get_current_time":
                 return time_tools.get_current_time(args.get("timezone", "UTC"))
+            elif tool_name == "read_logs":
+                return read_logs(
+                    requesting_user_id=requesting_user_id,
+                    level=args.get("level"),
+                    limit=int(args.get("limit", 50)),
+                )
             else:
                 return f"Unknown tool: {tool_name}"
     except asyncio.TimeoutError:

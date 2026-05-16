@@ -8,6 +8,7 @@ A lightweight Discord DM bot that runs a local LLM via [llama.cpp](https://githu
 - **Deep web search** via Brave Search API — fetches and summarises actual page content, not just index snippets
 - **Reddit search** — searches Reddit posts and discussions via the unauthenticated JSON API
 - **Scheduled prompts** — users define recurring jobs via natural language; the LLM converts schedules to cron expressions and calls `schedule_job` directly; commands (`jobs list`, `jobs cancel <id>`) are also available
+- **Self-diagnostics** — the LLM can call `read_logs` to read and reason over the audit log in real time; ask *"why did my last job fail?"* or *"check the logs for errors"* conversationally
 - **Model-agnostic inference** — auto-detects model family once on startup; swap models by changing one line in `.env`
 - **Thinking model support** — automatically strips `<think>` blocks for reasoning models (Gemma, DeepSeek, Qwen)
 - **Rate limiting** — per-user cooldown with bounded memory (stale entries are automatically evicted)
@@ -143,6 +144,7 @@ Open `.env` and fill in at minimum:
 | `BRAVE_API_KEY` | — | Leave blank to disable web search |
 | `LLAMA_SERVER_MODEL_FAMILY` | — | Leave blank for auto-detection (see [Swapping Models](#swapping-models)) |
 | `MODEL_TEMPERATURE` | — | Default `0.3`; try `0.1` for smaller/chattier models |
+| `BOT_OWNER_ID` | — | Your Discord user ID. When set, grants you full log access across all users (see [Self-Diagnostics](#self-diagnostics)) |
 
 Example values on Windows:
 ```env
@@ -187,6 +189,7 @@ src/localbot/
 │   └── llamacpp_client.py  # OpenAI-compatible HTTP client, model detection, think-strip
 ├── tools/
 │   ├── registry.py         # Tool schemas + dispatcher (static + scheduler)
+│   ├── log_reader.py       # read_logs — audit log reader for self-diagnostics
 │   ├── scheduler_tools.py  # LLM-callable schedule_job / cancel_job / list_jobs wrappers
 │   ├── search.py           # Brave Search + page fetch & summarise
 │   ├── reddit.py           # Reddit JSON API (no auth required)
@@ -284,6 +287,49 @@ LLAMA_SERVER_EXTRA_ARGS=--reasoning-budget 512
 
 ---
 
+## Self-Diagnostics
+
+LocalBot can read and reason over its own audit log in real time. Just ask conversationally:
+
+> *"Why did my 8am reminder not fire?"*
+> *"Check the logs for any errors"*
+> *"What did you search for last time?"*
+> *"Are there any crashes or timeouts?"*
+
+The LLM calls the `read_logs` tool, receives a filtered JSON slice of the audit log, and explains what it finds in plain language.
+
+### Access control
+
+By default every user sees only their own audit entries — the tool is scoped to the requesting user's ID so the LLM cannot expose another user's conversation history even if prompted to.
+
+Set `BOT_OWNER_ID` in `.env` to your Discord user ID to unlock full log access (all users, all events) for troubleshooting global issues:
+
+```env
+BOT_OWNER_ID=123456789012345678
+```
+
+### What the audit log contains
+
+Every JSONL entry has at minimum a `ts` (Unix timestamp) and an `event` field:
+
+| Event | Description |
+|---|---|
+| `user_message` | Incoming user message |
+| `assistant_reply` | Final reply sent to the user (timeouts are recorded distinctly) |
+| `tool_call` | LLM requested a tool with these arguments |
+| `tool_result` | First 500 chars of the tool's return value |
+
+### Log level filtering
+
+When asking the bot to check logs you can be specific:
+
+> *"Show me only errors from the logs"*
+> *"Check for any warnings or timeouts"*
+
+Audit entries are mapped to notional log levels: `tool_call` / `tool_result` / `user_message` / `assistant_reply` → **INFO**; timeout or missed-job events → **WARNING**; error/fail/crash events → **ERROR**.
+
+---
+
 ## Scheduled Jobs
 
 Users can schedule recurring prompts in two ways:
@@ -323,6 +369,7 @@ Cron expressions are validated before registration — invalid field ranges and 
 - Timezone strings are validated against the IANA `zoneinfo` database before being stored.
 - The audit log at `AUDIT_LOG_PATH` records all interactions for review. Timeout responses are recorded distinctly from genuine LLM replies.
 - Scheduler tool calls (`schedule_job`, `cancel_job`, `list_jobs`) are scoped per-request to the authenticated user — the LLM cannot create or cancel jobs for other users.
+- `read_logs` is scoped to the requesting user's ID by default. Set `BOT_OWNER_ID` to grant a single trusted user full log visibility. The LLM cannot bypass this scoping even if prompted to.
 
 ---
 
