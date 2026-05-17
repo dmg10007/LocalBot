@@ -49,8 +49,14 @@ class SchedulerService:
     def __init__(self, send_cb: SendCallback) -> None:
         self._send = send_cb
         self._scheduler = AsyncIOScheduler()
+        # Captured at start() time so _fire_sync can bridge from the
+        # APScheduler thread pool back onto the correct asyncio event loop.
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     def start(self) -> None:
+        # Capture the running loop here, on the asyncio thread, before any
+        # job callbacks can fire.
+        self._loop = asyncio.get_event_loop()
         self._scheduler.add_listener(
             self._on_job_event,
             EVENT_JOB_ERROR | EVENT_JOB_MISSED,
@@ -120,17 +126,26 @@ class SchedulerService:
         )
 
     def _fire_sync(self, user_id: str, prompt: str) -> None:
-        """Synchronous APScheduler callback.
+        """Synchronous APScheduler callback — runs in a ThreadPoolExecutor worker.
 
-        Fix #2: use get_running_loop() instead of get_event_loop().
-        get_event_loop() is deprecated in Python 3.10+ and will raise
-        RuntimeError in a future version when no current loop exists in the
-        calling thread. get_running_loop() raises RuntimeError immediately if
-        called outside a running loop, making misconfiguration loudly visible.
+        AsyncIOScheduler dispatches job callbacks through a ThreadPoolExecutor
+        by default, so this method is *not* called from the asyncio thread.
+        asyncio.get_running_loop() therefore raises RuntimeError here because
+        there is no running event loop on the worker thread.
+
+        Fix: use loop.call_soon_threadsafe() to safely schedule the coroutine
+        onto the asyncio event loop that was captured at start() time. This is
+        the canonical pattern for bridging a thread pool with asyncio.
         """
-        asyncio.get_running_loop().create_task(
+        if self._loop is None or self._loop.is_closed():
+            log.error(
+                "Job %s for user %s could not fire — event loop is not available.",
+                user_id, user_id,
+            )
+            return
+        self._loop.call_soon_threadsafe(
+            self._loop.create_task,
             self._fire(user_id, prompt),
-            name=f"scheduler-fire-{user_id}",
         )
 
     async def _fire(self, user_id: str, prompt: str) -> None:
@@ -174,9 +189,6 @@ class SchedulerService:
         return job
 
     def cancel_job(self, job_id: str) -> bool:
-        # Fix #11: catch only JobLookupError (job not found in scheduler)
-        # instead of bare Exception, which would swallow genuine errors like
-        # the scheduler not being started.
         try:
             self._scheduler.remove_job(job_id)
         except JobLookupError:
