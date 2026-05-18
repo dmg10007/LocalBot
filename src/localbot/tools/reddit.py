@@ -11,8 +11,6 @@ from localbot.config import cfg
 
 log = logging.getLogger(__name__)
 
-# Module-level session reused across calls to avoid per-request TCP overhead.
-# aiohttp explicitly recommends against creating a new session per request.
 _session: aiohttp.ClientSession | None = None
 
 
@@ -37,7 +35,6 @@ def _clean_subreddit(subreddit: str) -> str:
 
 
 async def reddit_search(query: str, subreddit: str | None = None) -> str:
-    # Fix #13: use dict[str, Any] instead of bare dict.
     if subreddit:
         subreddit = _clean_subreddit(subreddit)
         url = f"https://www.reddit.com/r/{subreddit}/search.json"
@@ -61,12 +58,27 @@ async def reddit_search(query: str, subreddit: str | None = None) -> str:
     if not posts:
         return "No Reddit results found."
 
-    lines = []
+    content_blocks: list[str] = []
+    source_lines: list[str] = []
+
     for i, p in enumerate(posts[: cfg.search_result_count], 1):
         d = p["data"]
-        lines.append(
-            f"{i}. **{d.get('title', '')}** (r/{d.get('subreddit', '')})\n"
-            f"   https://reddit.com{d.get('permalink', '')}\n"
-            f"   \u2b06 {d.get('score', 0)} | {d.get('num_comments', 0)} comments"
+        title = d.get("title", "")
+        permalink = f"https://reddit.com{d.get('permalink', '')}"
+        subreddit_name = d.get("subreddit", "")
+        score = d.get("score", 0)
+        num_comments = d.get("num_comments", 0)
+
+        content_blocks.append(
+            f"{i}. **{title}** (r/{subreddit_name})\n"
+            f"   \u2b06 {score} | {num_comments} comments"
         )
-    return "\n\n".join(lines)
+        source_lines.append(f"[{i}] {title} — {permalink}")
+
+    sources_footer = (
+        "\n\n---\nSOURCES (you MUST cite these inline using [1], [2] … "
+        "and list them at the end of your reply):\n"
+        + "\n".join(source_lines)
+    )
+
+    return "\n\n".join(content_blocks) + sources_footer
