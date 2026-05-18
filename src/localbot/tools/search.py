@@ -27,9 +27,6 @@ _FETCH_UA = (
 )
 
 # Domains that reliably block scrapers or return useless content.
-# Fix #9 (prior): "pdf" removed from this set — it was matching any URL
-# containing the substring "pdf". PDF files are detected in _should_skip()
-# via an endswith() check on the path instead.
 _SKIP_DOMAINS = frozenset([
     "youtube.com", "youtu.be",
     "twitter.com", "x.com",
@@ -56,9 +53,7 @@ async def close_session() -> None:
 def _should_skip(url: str) -> bool:
     """Return True for URLs we know won't yield useful scraped text."""
     lower = url.lower()
-    # Detect raw PDF URLs by checking the path extension, not by substring
-    # matching which incorrectly skips /pdf-guide/, pdfhost.io, etc.
-    path = lower.split("?")[0]  # strip query string before checking extension
+    path = lower.split("?")[0]
     if path.endswith(".pdf"):
         return True
     return any(domain in lower for domain in _SKIP_DOMAINS)
@@ -68,20 +63,14 @@ def _extract_text(html: str, max_chars: int) -> str:
     """Strip HTML and return clean readable text up to max_chars."""
     soup = BeautifulSoup(html, "html.parser")
 
-    # Remove non-content elements
     for tag in soup(["script", "style", "nav", "header", "footer",
                      "aside", "form", "noscript", "iframe"]):
         tag.decompose()
 
-    # Prefer <article> or <main> if available for higher signal-to-noise ratio
     body = soup.find("article") or soup.find("main") or soup.body or soup
-
     text = body.get_text(separator=" ", strip=True)  # type: ignore[union-attr]
-
-    # Collapse whitespace
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
-
     return text[:max_chars].strip()
 
 
@@ -139,7 +128,6 @@ async def web_search(query: str) -> str:
     if not results:
         return "No results found."
 
-    # Fetch the top N pages concurrently.
     top = results[: cfg.search_result_count]
     fetch_targets = top[: cfg.search_fetch_count]
     page_texts = await asyncio.gather(
@@ -147,9 +135,10 @@ async def web_search(query: str) -> str:
         return_exceptions=False,
     )
 
-    # Fix #9: use zip_longest to pair results with their fetched text without
-    # fragile manual index arithmetic. Results beyond fetch_targets get None.
-    lines: list[str] = []
+    # Build result blocks (content + metadata) and a parallel sources list.
+    content_blocks: list[str] = []
+    source_lines: list[str] = []
+
     for i, (r, page_content) in enumerate(
         itertools.zip_longest(top, page_texts, fillvalue=None), 1
     ):
@@ -159,12 +148,19 @@ async def web_search(query: str) -> str:
         url = r.get("url", "")
         description = r.get("description", "")
 
-        block = f"{i}. **{title}**\n   {url}"
+        block = f"{i}. **{title}**"
         if page_content:
             block += f"\n\n   {page_content}"
         elif description:
             block += f"\n   {description}"
 
-        lines.append(block)
+        content_blocks.append(block)
+        source_lines.append(f"[{i}] {title} — {url}")
 
-    return "\n\n---\n\n".join(lines)
+    sources_footer = (
+        "\n\n---\nSOURCES (you MUST cite these inline using [1], [2] … "
+        "and list them at the end of your reply):\n"
+        + "\n".join(source_lines)
+    )
+
+    return "\n\n---\n\n".join(content_blocks) + sources_footer

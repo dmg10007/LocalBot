@@ -59,6 +59,12 @@ RULES:
 7. Keep responses concise and friendly.
 8. When the user asks to check logs, troubleshoot an issue, or asks why
    something went wrong — call read_logs immediately.
+9. After any web_search or reddit_search, you MUST cite your sources.
+   - Reference each source inline with [1], [2], [3] … where the number
+     matches the SOURCES list at the end of the tool result.
+   - End your reply with a "Sources:" section listing each cited source
+     as a clickable markdown link: [1] [Title](URL)
+   - Do NOT omit sources. Do NOT summarise without citing.
 """
 
 _SYSTEM_ECHO_MARKERS = (
@@ -218,7 +224,7 @@ class Agent:
                 messages.append({"role": "assistant", "content": None, "tool_calls": msg["tool_calls"]})
                 messages.append({
                     "role": "user",
-                    "content": "Please summarise all the information you have gathered and give me a final answer.",
+                    "content": "Please summarise all the information you have gathered and give me a final answer. Remember to cite your sources with [1], [2] … and list them at the end.",
                 })
                 final = await self._client.chat(messages, tools=None)
                 return final["choices"][0]["message"].get("content") or ""
@@ -273,7 +279,7 @@ class Agent:
             if not any_new:
                 messages.append({
                     "role": "user",
-                    "content": "You have all the information needed. Please give your final answer now.",
+                    "content": "You have all the information needed. Please give your final answer now. Remember to cite your sources with [1], [2] … and list them at the end.",
                 })
                 final = await self._client.chat(messages, tools=None)
                 return final["choices"][0]["message"].get("content") or ""
