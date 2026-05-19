@@ -5,11 +5,13 @@ import asyncio
 import logging
 import re
 import time
+from pathlib import Path
 from typing import Callable, Awaitable
 
 import discord
 
 from localbot.adapters.llamacpp_client import LlamaCppClient
+from localbot.adapters.llamacpp_downloader import download_and_install
 from localbot.adapters.llamacpp_server import LlamaCppServer
 from localbot.adapters.llamacpp_updater import check_for_update
 from localbot.agent import Agent
@@ -251,14 +253,56 @@ class LocalBot(discord.Client):
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _prompt_stdin(prompt: str) -> str:
+    """Read a line from stdin synchronously (run in a thread executor)."""
+    return input(prompt)
+
+
+async def _ask_terminal(prompt: str, timeout: float) -> str | None:
+    """Print *prompt* and read one line from stdin without blocking the loop.
+
+    Returns the stripped response, or ``None`` on timeout or EOF.
+    """
+    loop = asyncio.get_event_loop()
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, _prompt_stdin, prompt),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        print()  # newline so the next log line isn't on the prompt line
+        return None
+    except EOFError:
+        # Non-interactive stdin (e.g. piped input / CI); treat as "no".
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Update check helper (module-level so it is easy to test in isolation)
 # ---------------------------------------------------------------------------
 
-async def _check_for_llama_update() -> None:
-    """Run the llama.cpp update check and log the result.
+async def _check_for_llama_update(*, _already_updated: bool = False) -> None:
+    """Run the llama.cpp update check and, if an update is available, offer
+    to install it.
 
-    Never raises — a failed check is logged as a warning and startup
-    continues normally.  Controlled by ``cfg.llama_update_check``.
+    Flow
+    ----
+    1. Query GitHub Releases API for the latest build number.
+    2. Compare against the installed build (via ``llama-server --version``).
+    3. If up to date, log INFO and return.
+    4. If an update is available:
+       a. If ``LLAMA_UPDATE_AUTO=true``, install immediately.
+       b. Otherwise, prompt the terminal operator with a ``[y/N]`` question
+          (waits up to ``LLAMA_UPDATE_PROMPT_TIMEOUT_SECONDS`` seconds before
+          continuing without updating).
+    5. On successful install, re-run the check once so the post-install build
+       number is logged (guarded by ``_already_updated`` to prevent loops).
+
+    Never raises — a failed check or failed download is logged as a warning
+    and startup continues normally.  Controlled by ``cfg.llama_update_check``.
     """
     if not cfg.llama_update_check:
         log.debug("llama.cpp update check disabled (LLAMA_UPDATE_CHECK=false)")
@@ -276,19 +320,53 @@ async def _check_for_llama_update() -> None:
 
     current_str = f"b{info.current}" if info.current is not None else "unknown"
 
-    if info.available:
-        log.warning(
-            "llama.cpp update available: %s → b%s  Download: %s",
-            current_str,
-            info.latest,
-            info.url,
-        )
+    if not info.available:
+        log.info("llama.cpp is up to date (%s, latest b%s)", current_str, info.latest)
+        return
+
+    log.warning(
+        "llama.cpp update available: %s → b%s  (%s)",
+        current_str, info.latest, info.url,
+    )
+
+    if _already_updated:
+        # Prevent an infinite loop if the post-install version still doesn't
+        # match (e.g. partial extraction).
+        return
+
+    # ── Decide whether to install ─────────────────────────────────────────
+    if cfg.llama_update_auto:
+        do_update = True
+        log.info("LLAMA_UPDATE_AUTO=true — installing update automatically.")
     else:
-        log.info(
-            "llama.cpp is up to date (%s, latest b%s)",
-            current_str,
-            info.latest,
+        answer = await _ask_terminal(
+            f"\nInstall llama.cpp b{info.latest}? [y/N] (auto-skip in "
+            f"{cfg.llama_update_prompt_timeout_seconds}s): ",
+            timeout=float(cfg.llama_update_prompt_timeout_seconds),
         )
+        if answer is None:
+            log.info("Update prompt timed out — continuing without updating.")
+            return
+        do_update = answer.strip().lower() in ("y", "yes")
+
+    if not do_update:
+        log.info("Update declined — continuing with current version.")
+        return
+
+    # ── Download and install ───────────────────────────────────────────────
+    install_dir = Path(cfg.llama_server_executable).parent
+    log.info("Installing llama.cpp b%s into %s ...", info.latest, install_dir)
+    result = await download_and_install(
+        install_dir,
+        timeout_seconds=120.0,
+    )
+
+    if result.ok:
+        log.info("llama.cpp updated successfully: %s", result.message)
+        # Re-run the check once to log the confirmed installed version.
+        await _check_for_llama_update(_already_updated=True)
+    else:
+        log.warning("llama.cpp update failed: %s — continuing with current version.", result.message)
 
 
 def main() -> None:

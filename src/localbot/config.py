@@ -51,6 +51,13 @@ class Config:
     llama_update_check_timeout_seconds: int = field(
         default_factory=lambda: _get_int("LLAMA_UPDATE_CHECK_TIMEOUT_SECONDS", 10)
     )
+    # When true, install updates automatically without prompting.
+    # When false (default), the terminal operator is prompted at startup.
+    llama_update_auto: bool = field(default_factory=lambda: _get_bool("LLAMA_UPDATE_AUTO", False))
+    # Seconds to wait for a [y/N] response before continuing without updating.
+    llama_update_prompt_timeout_seconds: int = field(
+        default_factory=lambda: _get_int("LLAMA_UPDATE_PROMPT_TIMEOUT_SECONDS", 30)
+    )
 
     brave_api_key: str = field(default_factory=lambda: _get("BRAVE_API_KEY"))
     search_result_count: int = field(default_factory=lambda: _get_int("SEARCH_RESULT_COUNT", 5))
