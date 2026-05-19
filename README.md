@@ -11,6 +11,7 @@ A lightweight Discord DM bot that runs a local LLM via [llama.cpp](https://githu
 - **Self-diagnostics** — the LLM can call `read_logs` to read and reason over the audit log in real time; ask *"why did my last job fail?"* or *"check the logs for errors"* conversationally
 - **Model-agnostic inference** — auto-detects model family once on startup; swap models by changing one line in `.env`
 - **Thinking model support** — automatically strips `<think>` blocks for reasoning models (Gemma, DeepSeek, Qwen)
+- **Automatic update checks** — on each startup LocalBot queries the llama.cpp GitHub Releases API and logs a warning if a newer build is available; can be disabled for air-gapped hosts
 - **Rate limiting** — per-user cooldown with bounded memory (stale entries are automatically evicted)
 - **Self-healing** — detects llama-server crashes and restarts automatically
 - **Audit log** — append-only JSONL log of all user messages and bot replies (timeouts are logged separately from genuine replies)
@@ -145,6 +146,8 @@ Open `.env` and fill in at minimum:
 | `LLAMA_SERVER_MODEL_FAMILY` | — | Leave blank for auto-detection (see [Swapping Models](#swapping-models)) |
 | `MODEL_TEMPERATURE` | — | Default `0.3`; try `0.1` for smaller/chattier models |
 | `BOT_OWNER_ID` | — | Your Discord user ID. When set, grants you full log access across all users (see [Self-Diagnostics](#self-diagnostics)) |
+| `LLAMA_UPDATE_CHECK` | — | Default `true`. Set to `false` to disable update checks (e.g. air-gapped hosts) |
+| `LLAMA_UPDATE_CHECK_TIMEOUT_SECONDS` | — | Default `10`. Increase on very slow connections |
 
 Example values on Windows:
 ```env
@@ -174,6 +177,21 @@ python -m localbot
 
 `llama-server` is started automatically as a subprocess. You do **not** need to start it manually. Its output (including any crash messages) is captured and forwarded to the application log.
 
+On each startup LocalBot checks the [llama.cpp releases page](https://github.com/ggml-org/llama.cpp/releases/latest) and logs an update notice if a newer build is available:
+
+```
+INFO  Checking for llama.cpp updates...
+WARNING  llama.cpp update available: b9100 → b9222  Download: https://github.com/ggml-org/llama.cpp/releases/tag/b9222
+```
+
+If already up to date:
+
+```
+INFO  llama.cpp is up to date (b9222, latest b9222)
+```
+
+Set `LLAMA_UPDATE_CHECK=false` in `.env` to disable this check entirely.
+
 ---
 
 ## Project Layout
@@ -186,7 +204,8 @@ src/localbot/
 ├── agent.py                # Core request/tool loop
 ├── adapters/
 │   ├── llamacpp_server.py  # llama-server subprocess manager + log capture
-│   └── llamacpp_client.py  # OpenAI-compatible HTTP client, model detection, think-strip
+│   ├── llamacpp_client.py  # OpenAI-compatible HTTP client, model detection, think-strip
+│   └── llamacpp_updater.py # llama.cpp update checker (GitHub Releases API)
 ├── tools/
 │   ├── registry.py         # Tool schemas + dispatcher (static + scheduler)
 │   ├── log_reader.py       # read_logs — audit log reader for self-diagnostics
@@ -203,6 +222,23 @@ src/localbot/
 │   └── audit.py            # Append-only JSONL audit log
 └── messaging.py            # Discord 2000-char message splitting
 ```
+
+---
+
+## Automatic Update Checks
+
+On each startup, LocalBot runs `llama-server --version` to detect the installed build number, then queries the [ggml-org/llama.cpp GitHub Releases API](https://api.github.com/repos/ggml-org/llama.cpp/releases/latest) to find the latest release tag.
+
+- Both operations run **concurrently** and are bounded by `LLAMA_UPDATE_CHECK_TIMEOUT_SECONDS` (default 10 s).
+- The check is **best-effort** — a network failure, timeout, or unrecognised version string is logged as a `WARNING` and startup continues normally.
+- No authentication token is required. The unauthenticated GitHub rate limit (60 requests/hour per IP) is well within normal startup frequency.
+- Set `LLAMA_UPDATE_CHECK=false` in `.env` to disable entirely — useful for air-gapped machines or CI environments.
+
+| Log level | Condition |
+|---|---|
+| `INFO` | Up to date, or check disabled |
+| `WARNING` | Newer build found — includes download URL |
+| `WARNING` | Check failed (network error, timeout, parse failure) |
 
 ---
 
@@ -370,6 +406,7 @@ Cron expressions are validated before registration — invalid field ranges and 
 - The audit log at `AUDIT_LOG_PATH` records all interactions for review. Timeout responses are recorded distinctly from genuine LLM replies.
 - Scheduler tool calls (`schedule_job`, `cancel_job`, `list_jobs`) are scoped per-request to the authenticated user — the LLM cannot create or cancel jobs for other users.
 - `read_logs` is scoped to the requesting user's ID by default. Set `BOT_OWNER_ID` to grant a single trusted user full log visibility. The LLM cannot bypass this scoping even if prompted to.
+- The update checker contacts only the public GitHub Releases API (`api.github.com`) and sends no user data. Set `LLAMA_UPDATE_CHECK=false` to prevent any outbound network call at startup.
 
 ---
 
