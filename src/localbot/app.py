@@ -11,6 +11,7 @@ import discord
 
 from localbot.adapters.llamacpp_client import LlamaCppClient
 from localbot.adapters.llamacpp_server import LlamaCppServer
+from localbot.adapters.llamacpp_updater import check_for_update
 from localbot.agent import Agent
 from localbot.config import cfg
 from localbot.scheduler.service import SchedulerService
@@ -159,6 +160,7 @@ class LocalBot(discord.Client):
 
     async def _start_backend(self) -> None:
         try:
+            await _check_for_llama_update()
             await self._server.start()
             await self._client.wait_until_ready()
             self._scheduler.start()
@@ -246,6 +248,47 @@ class LocalBot(discord.Client):
                 await dm.send(chunk)
         except Exception:
             log.exception("Failed to deliver scheduled message to user %s", user_id)
+
+
+# ---------------------------------------------------------------------------
+# Update check helper (module-level so it is easy to test in isolation)
+# ---------------------------------------------------------------------------
+
+async def _check_for_llama_update() -> None:
+    """Run the llama.cpp update check and log the result.
+
+    Never raises — a failed check is logged as a warning and startup
+    continues normally.  Controlled by ``cfg.llama_update_check``.
+    """
+    if not cfg.llama_update_check:
+        log.debug("llama.cpp update check disabled (LLAMA_UPDATE_CHECK=false)")
+        return
+
+    log.info("Checking for llama.cpp updates...")
+    info = await check_for_update(
+        cfg.llama_server_executable,
+        timeout_seconds=float(cfg.llama_update_check_timeout_seconds),
+    )
+
+    if info is None:
+        log.warning("llama.cpp update check failed (network unavailable or rate-limited); continuing")
+        return
+
+    current_str = f"b{info.current}" if info.current is not None else "unknown"
+
+    if info.available:
+        log.warning(
+            "llama.cpp update available: %s → b%s  Download: %s",
+            current_str,
+            info.latest,
+            info.url,
+        )
+    else:
+        log.info(
+            "llama.cpp is up to date (%s, latest b%s)",
+            current_str,
+            info.latest,
+        )
 
 
 def main() -> None:

@@ -22,6 +22,13 @@ def _get_float(key: str, default: float) -> float:
     return float(val) if val is not None else default
 
 
+def _get_bool(key: str, default: bool) -> bool:
+    val = os.environ.get(key)
+    if val is None:
+        return default
+    return val.strip().lower() not in ("0", "false", "no", "off")
+
+
 @dataclass
 class Config:
     discord_bot_token: str = field(default_factory=lambda: _get("DISCORD_BOT_TOKEN"))
@@ -37,6 +44,13 @@ class Config:
     # Override auto-detected model family: gemma | llama | mistral | qwen | deepseek | phi
     # Use this if the model filename doesn't match the auto-detection patterns.
     llama_server_model_family: str = field(default_factory=lambda: _get("LLAMA_SERVER_MODEL_FAMILY"))
+
+    # Update checker — queries the GitHub Releases API on startup.
+    # Set LLAMA_UPDATE_CHECK=false to disable entirely (e.g. air-gapped hosts).
+    llama_update_check: bool = field(default_factory=lambda: _get_bool("LLAMA_UPDATE_CHECK", True))
+    llama_update_check_timeout_seconds: int = field(
+        default_factory=lambda: _get_int("LLAMA_UPDATE_CHECK_TIMEOUT_SECONDS", 10)
+    )
 
     brave_api_key: str = field(default_factory=lambda: _get("BRAVE_API_KEY"))
     search_result_count: int = field(default_factory=lambda: _get_int("SEARCH_RESULT_COUNT", 5))
