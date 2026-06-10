@@ -48,7 +48,8 @@ services:
     container_name: localbot-webui
     restart: unless-stopped
     env_file: .env
-    command: localbot-webui
+    # Use python -m so the entry point is always found regardless of PATH.
+    command: ["python", "-m", "localbot.webui"]
     ports:
       - "8080:8080"
     environment:

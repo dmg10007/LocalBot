@@ -27,5 +27,6 @@ RUN if [ -n "$EXTRA" ]; then \
 # Create directories that are expected at runtime.
 RUN mkdir -p storage logs sandbox
 
-# Default command: run the Discord bot.
-CMD ["localbot"]
+# Use python -m so the entry point works regardless of whether
+# console_scripts are on PATH (avoids 'executable not found' in containers).
+CMD ["python", "-m", "localbot"]
