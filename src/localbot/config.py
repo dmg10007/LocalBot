@@ -3,9 +3,14 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Resolved once at import time so __post_init__ can validate paths
+# against a stable anchor regardless of later os.chdir() calls.
+_PROJECT_ROOT = Path.cwd().resolve()
 
 
 def _get(key: str, default: str = "") -> str:
@@ -27,6 +32,24 @@ def _get_bool(key: str, default: bool) -> bool:
     if val is None:
         return default
     return val.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _safe_path(value: str, env_key: str) -> str:
+    """Resolve *value* and ensure it stays within the project root.
+
+    Raises ValueError if the resolved path escapes the project root,
+    which prevents directory-traversal attacks via malicious env vars.
+    """
+    resolved = (_PROJECT_ROOT / value).resolve()
+    try:
+        resolved.relative_to(_PROJECT_ROOT)
+    except ValueError:
+        raise ValueError(
+            f"{env_key}={value!r} resolves to {resolved}, which is outside "
+            f"the project root {_PROJECT_ROOT}. Use a relative path or a "
+            f"subdirectory of the project."
+        )
+    return str(resolved)
 
 
 @dataclass
@@ -121,6 +144,11 @@ class Config:
                 f"Missing required environment variables: {', '.join(missing)}. "
                 "Copy .env.example to .env and fill in the required values."
             )
+
+        # Security: resolve storage paths and ensure they stay inside the
+        # project root to prevent directory-traversal via malicious env vars.
+        self.database_path = _safe_path(self.database_path, "DATABASE_PATH")
+        self.audit_log_path = _safe_path(self.audit_log_path, "AUDIT_LOG_PATH")
 
 
 cfg = Config()
