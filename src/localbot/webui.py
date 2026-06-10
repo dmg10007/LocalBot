@@ -78,7 +78,7 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
     USER_PREFIX: str = os.environ.get("WEBUI_USER_PREFIX", "webui:")
 
     # ------------------------------------------------------------------
-    # Lifespan (replaces deprecated @app.on_event handlers)
+    # Lifespan
     # ------------------------------------------------------------------
     @asynccontextmanager
     async def lifespan(app: fastapi.FastAPI) -> AsyncIterator[None]:  # noqa: ARG001
@@ -87,14 +87,27 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
         registry = ModelRegistry()
         scheduler = SchedulerService(_null_send)
         _agent = Agent(registry, scheduler=scheduler)
-        await registry.warm_general()
         scheduler.start()
-        log.info("LocalBot webui ready")
 
-        # Store on app.state so routes can access if needed in future.
         app.state.registry = registry
         app.state.scheduler = scheduler
         app.state.agent = _agent
+        # Mark the app as not yet warmed — requests will 503 until the
+        # model is loaded.  warm_general() runs in the background so a
+        # slow CPU model load doesn't block uvicorn from coming up.
+        app.state.ready = False
+
+        async def _warm() -> None:
+            try:
+                await registry.warm_general()
+                app.state.ready = True
+                log.info("LocalBot webui ready")
+            except Exception:
+                log.exception(
+                    "warm_general() failed — webui will retry on first request"
+                )
+
+        asyncio.create_task(_warm())
 
         yield
 
@@ -138,7 +151,6 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
     ) -> str:
         """Validate Bearer token and return the internal user_id."""
         if API_KEY is None:
-            # Auth disabled — derive a stable guest id from IP.
             client_ip = (request.client.host if request.client else "unknown")
             return f"{USER_PREFIX}guest:{client_ip}"
 
@@ -148,8 +160,6 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
                 detail="Invalid or missing Bearer token.",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-        # Use the raw token as the user discriminator so that multiple
-        # OpenWebUI accounts with different keys get isolated histories.
         return f"{USER_PREFIX}{creds.credentials}"
 
     # ------------------------------------------------------------------
@@ -157,6 +167,9 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
     # ------------------------------------------------------------------
     @app.get("/healthz", include_in_schema=False)
     async def healthz() -> dict[str, str]:
+        ready = getattr(app.state, "ready", False)
+        if not ready:
+            raise HTTPException(status_code=503, detail="Model is still loading")
         return {"status": "ok"}
 
     # ------------------------------------------------------------------
@@ -188,11 +201,16 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
         request: Request,
         user_id: str = Depends(_get_user_id),
     ) -> "fastapi.Response":  # type: ignore[name-defined]
+        if not getattr(request.app.state, "ready", False):
+            raise HTTPException(
+                status_code=503,
+                detail="Model is still loading, please retry in a moment.",
+            )
+
         body = await request.json()
         messages: list[dict] = body.get("messages", [])
         stream: bool = body.get("stream", False)
 
-        # Extract the last user turn as the prompt.
         user_text = ""
         for m in reversed(messages):
             if m.get("role") == "user":
@@ -204,8 +222,6 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
             raise HTTPException(status_code=400, detail="No user message found.")
 
         _agent: Agent = request.app.state.agent
-        if _agent is None:
-            raise HTTPException(status_code=503, detail="Agent not ready.")
 
         reply_future: asyncio.Future[str] = asyncio.get_event_loop().create_future()
 
@@ -226,7 +242,6 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
 
         if stream:
             async def _sse_chunks() -> AsyncIterator[bytes]:
-                # Stream the reply word-by-word for a natural typewriter effect.
                 words = reply.split(" ")
                 for i, word in enumerate(words):
                     token = word if i == len(words) - 1 else word + " "
@@ -244,9 +259,8 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
                         ],
                     }
                     yield b"data: " + json.dumps(chunk).encode() + b"\n\n"
-                    await asyncio.sleep(0)  # yield control to event loop
+                    await asyncio.sleep(0)
 
-                # Final chunk with finish_reason
                 done_chunk = {
                     "id": completion_id,
                     "object": "chat.completion.chunk",
@@ -272,7 +286,6 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
                 },
             )
 
-        # Non-streaming response
         return fastapi.responses.JSONResponse(
             content={
                 "id": completion_id,
