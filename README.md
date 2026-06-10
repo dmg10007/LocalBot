@@ -2,6 +2,8 @@
 
 A lightweight Discord DM bot that runs a local LLM via [llama.cpp](https://github.com/ggerganov/llama.cpp)'s built-in `llama-server`. The Python process is intentionally thin — it never loads the model itself; all inference goes through `llama-server`'s OpenAI-compatible HTTP API.
 
+LocalBot can also run **without Discord** as a plain HTTP server, exposing an OpenAI-compatible API that [OpenWebUI](https://github.com/open-webui/open-webui) (or any OpenAI-compatible client) can connect to directly.
+
 ## Features
 
 - **Conversational chat** with per-user message history (SQLite-backed)
@@ -18,8 +20,9 @@ A lightweight Discord DM bot that runs a local LLM via [llama.cpp](https://githu
 - **Self-healing** — detects llama-server crashes and restarts automatically
 - **Audit log** — append-only JSONL log of all user messages and bot replies; timeouts are recorded distinctly from genuine LLM replies
 - **llama-server log capture** — subprocess stdout/stderr is piped into the application logger so crashes (OOM, CUDA errors) surface immediately
+- **OpenWebUI / OpenAI-compatible HTTP API** — `localbot-webui` starts a FastAPI server on port 8000; stream or non-stream, Bearer token auth, Docker Compose stack included
 - **Auto-updater** — on startup, detects available llama.cpp updates and prompts the terminal operator to install; supports unattended mode via `LLAMA_UPDATE_AUTO=true`
-- **Minimal footprint** — discord.py + aiohttp + APScheduler + BeautifulSoup4; no heavy ML dependencies
+- **Minimal footprint** — discord.py + aiohttp + APScheduler + BeautifulSoup4; FastAPI/uvicorn only needed for the web UI extra
 
 ---
 
@@ -104,7 +107,7 @@ reasoning = "qwen3.5-7b-instruct-q5_k_m.gguf"
 | `coding` | Qwen3-Coder-30B-A3B (MoE) | Q4_K_M | ~18 GB |
 | `reasoning` | Qwen3.5-27B Reasoning-Distilled v2 | Q4_K_M | ~18 GB |
 
-### 4. A Discord Bot Token
+### 4. A Discord Bot Token *(Discord mode only)*
 
 1. Go to the [Discord Developer Portal](https://discord.com/developers/applications) and create a new application.
 2. Under **Bot**, click **Add Bot** and copy the token.
@@ -137,8 +140,11 @@ python -m venv .venv
 ### 3. Install dependencies
 
 ```bash
-# Runtime only
+# Discord bot only
 pip install -e .
+
+# Discord bot + OpenWebUI HTTP server
+pip install -e ".[webui]"
 
 # With dev tools (ruff, mypy, pytest)
 pip install -e ".[dev]"
@@ -164,14 +170,14 @@ Open `.env` and fill in at minimum:
 
 | Variable | Required | Description |
 |---|---|---|
-| `DISCORD_BOT_TOKEN` | ✅ | Your bot token from the Developer Portal |
+| `DISCORD_BOT_TOKEN` | ✅ *(Discord mode)* | Your bot token from the Developer Portal |
 | `LLAMA_SERVER_MODEL_PATH` | ✅ | Absolute path to your `.gguf` model file |
 | `LLAMA_SERVER_EXECUTABLE` | ✅ | Full path to the `llama-server` binary |
 | `LLAMA_SERVER_N_GPU_LAYERS` | — | `0` = CPU only (default), `-1` = all layers on GPU |
 | `BRAVE_API_KEY` | — | Leave blank to disable web search |
 | `LLAMA_SERVER_MODEL_FAMILY` | — | Leave blank for auto-detection (see [Swapping Models](#swapping-models)) |
 | `MODEL_TEMPERATURE` | — | Default `0.3`; try `0.1` for smaller/chattier models |
-| `BOT_OWNER_ID` | — | Your Discord user ID. When set, grants you full log access across all users (see [Self-Diagnostics](#self-diagnostics)) |
+| `BOT_OWNER_ID` | — | Your Discord user ID. When set, grants you full log access across all users |
 | `SANDBOX_ROOT` | — | Absolute path to the directory the LLM may read/write. Defaults to `./sandbox` |
 | `WEBUI_API_KEY` | — | Bearer token for the OpenWebUI API layer. Leave blank to disable auth (local use only) |
 | `WEBUI_HOST` | — | Host to bind the API server to. Defaults to `127.0.0.1` |
@@ -198,13 +204,21 @@ New-Item -ItemType Directory -Force -Path logs, storage, sandbox
 
 ### 6. Run the bot
 
+**Discord mode:**
 ```bash
 localbot
 # or
 python -m localbot
 ```
 
-`llama-server` is started automatically as a subprocess. You do **not** need to start it manually. Its stdout and stderr (including crash messages, OOM errors, and CUDA failures) are captured and forwarded to the application log.
+**HTTP / OpenWebUI mode:**
+```bash
+localbot-webui
+# or
+python -m localbot.webui
+```
+
+`llama-server` is started automatically as a subprocess in both modes. You do **not** need to start it manually. Its stdout and stderr (including crash messages, OOM errors, and CUDA failures) are captured and forwarded to the application log.
 
 If a newer llama.cpp build is available you will be prompted in the terminal before the server starts:
 
@@ -289,6 +303,7 @@ Each Bearer token value is treated as a distinct user ID (`webui:<token>`), keep
 src/localbot/
 ├── __main__.py             # `python -m localbot` entry point
 ├── app.py                  # Discord event loop, rate limiting, command handler
+├── webui.py                # FastAPI HTTP server — OpenAI-compatible API for OpenWebUI
 ├── config.py               # All settings loaded from .env
 ├── agent.py                # Core request/tool loop; intent routing (_select_slot, _detect_workspace_mode, _needs_tools)
 ├── webui.py                # FastAPI OpenAI-compatible API layer for OpenWebUI
@@ -321,6 +336,8 @@ tests/
 ├── test_routing_dispatch_filesystem.py  # Routing, async dispatch, filesystem sandbox
 ├── test_scheduler_validate_cron.py
 └── test_search_should_skip.py
+Dockerfile.webui                         # Container image for localbot-webui
+docker-compose.yml                       # LocalBot API + OpenWebUI stack
 ```
 
 ---
@@ -549,6 +566,7 @@ Cron expressions are validated against legal field ranges before registration �
 - Scheduler tool calls (`schedule_job`, `cancel_job`, `list_jobs`) are scoped per-request to the authenticated user — the LLM cannot create or cancel jobs for other users.
 - `read_logs` is scoped to the requesting user's ID by default. Set `BOT_OWNER_ID` to grant a single trusted user full log visibility. The LLM cannot bypass this scoping even if prompted to.
 - Filesystem tools are confined to `SANDBOX_ROOT`. Paths are resolved server-side; absolute paths are re-rooted and `../` traversal is blocked at the OS level before any I/O occurs.
+- The HTTP API (`localbot-webui`) requires a Bearer token when `WEBUI_API_KEY` is set. Each token value maps to an isolated user namespace — tokens cannot access each other's history.
 - The auto-updater downloads only from the official `ggml-org/llama.cpp` GitHub Releases. `LLAMA_SERVER_EXTRA_ARGS` is the only value passed directly to a subprocess and must be set only by a trusted operator via `.env`.
 - The OpenWebUI API layer (`webui.py`) requires a Bearer token when `WEBUI_API_KEY` is set. Each token value is treated as a distinct user ID to maintain conversation isolation. Do not expose `WEBUI_PORT` to the public internet without a reverse proxy and TLS.
 

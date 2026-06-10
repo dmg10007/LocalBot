@@ -1,0 +1,23 @@
+# Dockerfile.webui — LocalBot HTTP API server
+# Build: docker build -f Dockerfile.webui -t localbot-api .
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Install system dependencies for aiohttp and BeautifulSoup4
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml requirements.txt ./
+COPY src/ ./src/
+
+# Install package with webui extras
+RUN pip install --no-cache-dir -e ".[webui]"
+
+# Create expected directories
+RUN mkdir -p /app/storage /app/logs /app/sandbox
+
+EXPOSE 8000
+
+CMD ["localbot-webui"]

@@ -17,6 +17,10 @@ dependencies = [
 
 [project.optional-dependencies]
 pdf = ["pypdf>=4.0"]
+webui = [
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.29",
+]
 dev = [
     "ruff>=0.4",
     "mypy>=1.10",
@@ -26,6 +30,7 @@ dev = [
 
 [project.scripts]
 localbot = "localbot.app:main"
+localbot-webui = "localbot.webui:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
