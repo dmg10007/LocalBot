@@ -45,7 +45,7 @@ _STOP_TOKENS: dict[ModelFamily, list[str]] = {
     ModelFamily.LLAMA:    ["<|eot_id|>", "<|end_of_text|>", "<|eom_id|>"],
     ModelFamily.MISTRAL:  ["</s>", "[INST]"],
     ModelFamily.QWEN:     ["<|im_end|>", "<|endoftext|>"],
-    ModelFamily.DEEPSEEK: ["<\u2514\u2518>", "<|end_of_sentence|>"],
+    ModelFamily.DEEPSEEK: ["\u2514\u2518", "<|end_of_sentence|>"],
     ModelFamily.PHI:      ["<|end|>", "<|endoftext|>"],
     ModelFamily.UNKNOWN:  [],
 }
@@ -84,14 +84,23 @@ def strip_thinking(message: dict[str, Any]) -> str:
 
 
 class LlamaCppClient:
-    def __init__(self) -> None:
-        self._base = f"http://{cfg.llama_server_host}:{cfg.llama_server_port}"
+    def __init__(
+        self,
+        host: str | None = None,
+        port: int | None = None,
+    ) -> None:
+        # Fall back to the legacy single-server config for backward compat.
+        _host = host or cfg.llama_server_host
+        _port = port or cfg.llama_server_port
+        self._base = f"http://{_host}:{_port}"
         self._session: aiohttp.ClientSession | None = None
+        # Fix #13: cache family after first detection so subsequent calls to
+        # wait_until_ready() skip the /v1/models round-trip.
         self._family: ModelFamily = ModelFamily.UNKNOWN
         self._model_name: str = "unknown"
         # Fix #10: tracks whether the server has been confirmed healthy and
-        # model detection has run. Checked in Agent.handle() to skip
-        # wait_until_ready() on every message once the server is up.
+        # model detection has run. Checked by the registry to skip
+        # wait_until_ready() on subsequent requests once the server is up.
         self._is_ready: bool = False
 
     @property
@@ -112,10 +121,16 @@ class LlamaCppClient:
     async def detect_model(self) -> None:
         """Query /v1/models and classify the loaded model family.
 
-        Called once after the server is healthy. An env override
-        (LLAMA_SERVER_MODEL_FAMILY) takes priority over auto-detection
-        for fine-tunes or models with unusual filenames.
+        Called once after the server is healthy. Subsequent calls are
+        no-ops once the family has been determined (fix #13).
+
+        An env override (LLAMA_SERVER_MODEL_FAMILY) takes priority over
+        auto-detection for fine-tunes or models with unusual filenames.
         """
+        # Fix #13: skip detection if already resolved.
+        if self._family is not ModelFamily.UNKNOWN:
+            return
+
         override = cfg.llama_server_model_family.lower().strip()
         if override:
             family_map = {
@@ -131,7 +146,10 @@ class LlamaCppClient:
                 self._model_name = f"(override: {override})"
                 log.info("Model family overridden via env: %s", self._family.name)
                 return
-            log.warning("Unknown LLAMA_SERVER_MODEL_FAMILY value '%s' — falling back to auto-detect.", override)
+            log.warning(
+                "Unknown LLAMA_SERVER_MODEL_FAMILY value '%s' — falling back to auto-detect.",
+                override,
+            )
 
         session = self._get_session()
         try:
@@ -207,15 +225,13 @@ class LlamaCppClient:
                     timeout=aiohttp.ClientTimeout(total=3),
                 ) as r:
                     if r.status == 200:
-                        log.info("llama-server is ready")
-                        if self._family is ModelFamily.UNKNOWN:
-                            await self.detect_model()
-                        # Fix #10: mark the client as ready so Agent.handle()
-                        # can skip this probe on subsequent requests.
+                        log.info("llama-server (%s) is ready", self._base)
+                        # Fix #13: detect_model is a no-op if already resolved.
+                        await self.detect_model()
                         self._is_ready = True
                         return
             except Exception:
                 pass
-            log.debug("Waiting for llama-server... (%d/%d)", attempt + 1, retries)
+            log.debug("Waiting for llama-server %s... (%d/%d)", self._base, attempt + 1, retries)
             await asyncio.sleep(delay)
-        raise RuntimeError("llama-server did not become ready in time")
+        raise RuntimeError(f"llama-server {self._base} did not become ready in time")
