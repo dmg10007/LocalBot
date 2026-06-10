@@ -4,12 +4,17 @@
 #
 # The llama stage downloads the pre-built Ubuntu x64 llama-server release
 # and copies the binary + all shared libraries into the final image so the
-# dynamic linker can find libllama-server-impl.so at runtime.
+# dynamic linker can find libggml-cpu.so at runtime.
+#
+# Version pin: b9461 is the last known-good CPU-only release.
+# b9591 introduced a backend-plugin architecture that requires
+# ggml_backend_load_all() to be called before model load — the
+# pre-built binary does not do this, causing "no backends are loaded".
 
 # ── Stage 1: download llama-server + shared libs ────────────────────────
 FROM python:3.11-slim AS llama
 
-ARG LLAMA_VERSION=b9591
+ARG LLAMA_VERSION=b9461
 ARG LLAMA_URL=https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_VERSION}/llama-${LLAMA_VERSION}-bin-ubuntu-x64.tar.gz
 
 RUN apt-get update && apt-get install -y --no-install-recommends curl tar \
@@ -26,12 +31,13 @@ ARG EXTRA=""
 
 WORKDIR /app
 
-# Copy the llama-server binary and all companion shared libraries.
-COPY --from=llama /opt/llama/llama-server /usr/local/bin/llama-server
-COPY --from=llama /opt/llama/*.so* /usr/local/lib/
-
-# Ensure the dynamic linker picks up the new .so files.
-RUN ldconfig
+# Keep all llama release files together so relative .so paths resolve,
+# then register the directory with the dynamic linker.
+COPY --from=llama /opt/llama/ /opt/llama/
+RUN cp /opt/llama/llama-server /usr/local/bin/llama-server && \
+    chmod +x /usr/local/bin/llama-server && \
+    echo "/opt/llama" > /etc/ld.so.conf.d/llama.conf && \
+    ldconfig
 
 # Install build deps (needed for some aiohttp/lxml wheels on slim)
 RUN apt-get update && apt-get install -y --no-install-recommends \
