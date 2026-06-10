@@ -79,7 +79,7 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
         app.state.ready = False
 
         if cfg.llama_remote_host:
-            # ── Remote mode ─────────────────────────────────────────────
+            # ── Remote mode ──────────────────────────────────────────────────
             # Point a bare LlamaCppClient at the localbot container.
             # No subprocess is spawned — the model is already loaded there.
             log.info(
@@ -92,7 +92,6 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
                 port=cfg.llama_remote_port,
             )
 
-            # Wrap in a minimal registry-like shim so Agent works unchanged.
             class _RemoteRegistry:
                 async def acquire(self, slot: str) -> LlamaCppClient:  # noqa: ARG002
                     return remote_client
@@ -113,17 +112,22 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
                 try:
                     await remote_client.wait_until_ready(retries=60, delay=2.0)
                     app.state.ready = True
-                    log.info("LocalBot webui ready (remote mode: %s:%d)",
-                             cfg.llama_remote_host, cfg.llama_remote_port)
+                    log.info(
+                        "LocalBot webui ready (remote mode: %s:%d)",
+                        cfg.llama_remote_host,
+                        cfg.llama_remote_port,
+                    )
                 except Exception:
-                    log.exception("Could not reach remote llama-server at %s:%d",
-                                  cfg.llama_remote_host, cfg.llama_remote_port)
+                    log.exception(
+                        "Could not reach remote llama-server at %s:%d",
+                        cfg.llama_remote_host,
+                        cfg.llama_remote_port,
+                    )
 
             asyncio.create_task(_warm_remote())
 
         else:
-            # ── Local subprocess mode ──────────────────────────────────────
-            # Spawn llama-server as a child process (non-Docker or native use).
+            # ── Local subprocess mode ────────────────────────────────────────
             registry = ModelRegistry()
             _agent = Agent(registry, scheduler=scheduler)
             app.state.registry = registry
@@ -146,8 +150,7 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
 
         # ---- shutdown ----
         scheduler.stop()
-        registry_obj = app.state.registry
-        await registry_obj.shutdown()
+        await app.state.registry.shutdown()
         from localbot.tools import search as s, reddit as r
         await s.close_session()
         await r.close_session()
@@ -190,23 +193,37 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
             )
         return f"{USER_PREFIX}{creds.credentials}"
 
+    # ------------------------------------------------------------------
+    # /healthz
+    # ------------------------------------------------------------------
     @app.get("/healthz", include_in_schema=False)
     async def healthz() -> dict[str, str]:
         if not getattr(app.state, "ready", False):
             raise HTTPException(status_code=503, detail="Model is still loading")
         return {"status": "ok"}
 
+    # ------------------------------------------------------------------
+    # GET /v1/models  — no auth required (OpenWebUI polls this unauthenticated)
+    # ------------------------------------------------------------------
     @app.get("/v1/models")
-    async def list_models(user_id: str = Depends(_get_user_id)) -> dict:  # noqa: ARG001
+    async def list_models() -> dict:
         now = int(time.time())
         return {
             "object": "list",
             "data": [
-                {"id": f"localbot-{s}", "object": "model", "created": now, "owned_by": "localbot"}
+                {
+                    "id": f"localbot-{s}",
+                    "object": "model",
+                    "created": now,
+                    "owned_by": "localbot",
+                }
                 for s in ["general", "coding", "reasoning"]
             ],
         }
 
+    # ------------------------------------------------------------------
+    # POST /v1/chat/completions
+    # ------------------------------------------------------------------
     @app.post("/v1/chat/completions")
     async def chat_completions(
         request: Request,
@@ -250,35 +267,62 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
         if stream:
+            words = reply.split(" ")
+
             async def _sse_chunks() -> AsyncIterator[bytes]:
-                for i, word in enumerate(reply.split(" ")):
-                    token = word if i == len(reply.split(" ")) - 1 else word + " "
+                for i, word in enumerate(words):
+                    token = word if i == len(words) - 1 else word + " "
                     chunk = {
-                        "id": completion_id, "object": "chat.completion.chunk",
-                        "created": created, "model": model_id,
-                        "choices": [{"index": 0, "delta": {"role": "assistant", "content": token}, "finish_reason": None}],
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_id,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"role": "assistant", "content": token},
+                                "finish_reason": None,
+                            }
+                        ],
                     }
                     yield b"data: " + json.dumps(chunk).encode() + b"\n\n"
                     await asyncio.sleep(0)
                 done = {
-                    "id": completion_id, "object": "chat.completion.chunk",
-                    "created": created, "model": model_id,
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model_id,
                     "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                 }
                 yield b"data: " + json.dumps(done).encode() + b"\n\n"
                 yield b"data: [DONE]\n\n"
 
             return StreamingResponse(
-                _sse_chunks(), media_type="text/event-stream",
+                _sse_chunks(),
+                media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
 
-        return fastapi.responses.JSONResponse(content={
-            "id": completion_id, "object": "chat.completion",
-            "created": created, "model": model_id,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": reply}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-        })
+        return fastapi.responses.JSONResponse(
+            content={
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": model_id,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": reply},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                },
+            }
+        )
 
     return app
 

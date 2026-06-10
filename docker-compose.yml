@@ -13,7 +13,7 @@
 
 services:
 
-  # ── LocalBot (Discord bot + background scheduler) ──────────────────────────
+  # ── LocalBot (Discord bot + background scheduler) ────────────────────────
   localbot:
     build:
       context: .
@@ -26,16 +26,15 @@ services:
       - ./storage:/app/storage
       - ./logs:/app/logs
       - ./sandbox:/app/sandbox
-      - C:\llama:/llama:ro
     environment:
-      LLAMA_SERVER_EXECUTABLE: /llama/llama-server.exe
-      # Bind on all interfaces so localbot-webui can reach it.
+      # Use the Linux binary baked into the image — no Windows .exe needed.
+      LLAMA_SERVER_EXECUTABLE: /usr/local/bin/llama-server
       LLAMA_SERVER_HOST: 0.0.0.0
       LLAMA_SERVER_CLIENT_HOST: 127.0.0.1
     networks:
       - localbot-net
 
-  # ── LocalBot WebUI API bridge ───────────────────────────────────────────────
+  # ── LocalBot WebUI API bridge ─────────────────────────────────────────────
   localbot-webui:
     build:
       context: .
@@ -51,8 +50,8 @@ services:
     environment:
       WEBUI_HOST: 0.0.0.0
       WEBUI_PORT: "8080"
-      # Remote mode: connect to localbot's llama-server over the Docker
-      # bridge network instead of spawning a Windows .exe in a Linux container.
+      # Remote mode: forward requests to localbot's llama-server over the
+      # Docker bridge network instead of spawning a subprocess.
       LLAMA_REMOTE_HOST: localbot
       LLAMA_REMOTE_PORT: "8080"
     volumes:
@@ -63,7 +62,7 @@ services:
     networks:
       - localbot-net
 
-  # ── OpenWebUI ───────────────────────────────────────────────────────────────
+  # ── OpenWebUI ─────────────────────────────────────────────────────────────
   openwebui:
     image: ghcr.io/open-webui/open-webui:main
     container_name: openwebui
