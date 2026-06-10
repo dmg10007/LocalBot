@@ -45,7 +45,7 @@ _STOP_TOKENS: dict[ModelFamily, list[str]] = {
     ModelFamily.LLAMA:    ["<|eot_id|>", "<|end_of_text|>", "<|eom_id|>"],
     ModelFamily.MISTRAL:  ["</s>", "[INST]"],
     ModelFamily.QWEN:     ["<|im_end|>", "<|endoftext|>"],
-    ModelFamily.DEEPSEEK: ["<\u2514\u2518>", "<|end_of_sentence|>"],
+    ModelFamily.DEEPSEEK: ["└┘", "<|end_of_sentence|>"],
     ModelFamily.PHI:      ["<|end|>", "<|endoftext|>"],
     ModelFamily.UNKNOWN:  [],
 }
@@ -84,8 +84,15 @@ def strip_thinking(message: dict[str, Any]) -> str:
 
 
 class LlamaCppClient:
-    def __init__(self) -> None:
-        self._base = f"http://{cfg.llama_server_host}:{cfg.llama_server_port}"
+    def __init__(
+        self,
+        host: str | None = None,
+        port: int | None = None,
+    ) -> None:
+        # Per-slot overrides; fall back to global cfg when not provided.
+        _host = host or cfg.llama_server_host
+        _port = port or cfg.llama_server_port
+        self._base = f"http://{_host}:{_port}"
         self._session: aiohttp.ClientSession | None = None
         self._family: ModelFamily = ModelFamily.UNKNOWN
         self._model_name: str = "unknown"
