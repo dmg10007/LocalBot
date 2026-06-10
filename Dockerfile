@@ -3,18 +3,14 @@
 # Leave blank for the default Discord bot image.
 #
 # The llama stage downloads the pre-built Ubuntu x64 llama-server release
-# and copies the binary + all shared libraries into the final image so the
-# dynamic linker can find libggml-cpu.so at runtime.
-#
-# Version pin: b9590 is the last known-good CPU-only release before the
-# b9591 backend-plugin architecture change. b9591+ requires
-# ggml_backend_load_all() to be called before model load — the
-# pre-built binary does not do this, causing "no backends are loaded".
+# and copies the binary + all shared libraries into the final image.
+# All libggml-cpu-*.so, libggml-base.so, libllama.so etc. are co-located
+# in /opt/llama so the dynamic linker finds them via ld.so.conf at runtime.
 
 # ── Stage 1: download llama-server + shared libs ────────────────────────
 FROM python:3.11-slim AS llama
 
-ARG LLAMA_VERSION=b9590
+ARG LLAMA_VERSION=b9592
 ARG LLAMA_URL=https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_VERSION}/llama-${LLAMA_VERSION}-bin-ubuntu-x64.tar.gz
 
 RUN apt-get update && apt-get install -y --no-install-recommends curl tar \
