@@ -1,64 +1,88 @@
-# docker-compose.yml
-# One-command stack: LocalBot HTTP API + OpenWebUI
+# LocalBot — full stack
+# Starts the Discord bot, the OpenWebUI API bridge, and OpenWebUI itself.
 #
-# Prerequisites
-# -------------
-# 1. Copy .env.example to .env and fill in LLAMA_SERVER_EXECUTABLE,
-#    LLAMA_SERVER_MODEL_PATH, and optionally BRAVE_API_KEY.
-# 2. Set WEBUI_API_KEY in .env (or unset it to disable auth for local use).
-# 3. llama-server must be accessible from *inside* the localbot container
-#    (either installed at the path given by LLAMA_SERVER_EXECUTABLE on a
-#    bind-mounted host directory, or built into the image).
+# Prerequisites:
+#   1. Copy .env.example to .env and fill in your values.
+#   2. Place your GGUF model file(s) in a local folder and set
+#      SLOT_*_MODEL paths to match the container path (see volumes below).
 #
-# Usage
-# -----
-#   docker compose up
-#
-# Then open http://localhost:3000, go to Settings → Connections → OpenAI API:
-#   URL:  http://localbot-api:8000/v1
-#   Key:  <WEBUI_API_KEY from .env>  (or any string if auth is off)
+# Usage:
+#   docker compose up -d          # start all services
+#   docker compose logs -f        # stream logs
+#   docker compose down           # stop and remove containers
 
 services:
-  localbot-api:
+
+  # ── LocalBot (Discord bot + background scheduler) ──────────────────────────
+  localbot:
     build:
       context: .
-      dockerfile: Dockerfile.webui
+      dockerfile: Dockerfile
+    container_name: localbot
+    restart: unless-stopped
     env_file: .env
-    environment:
-      WEBUI_HOST: "0.0.0.0"
-      WEBUI_PORT: "8000"
-    ports:
-      - "8000:8000"
     volumes:
-      # Give the container access to the llama-server binary and models.
-      # Adjust these paths to match your host layout.
-      - "${LLAMA_SERVER_EXECUTABLE%/*}:/llama:ro"
-      - "${SANDBOX_ROOT:-./sandbox}:/sandbox"
+      # Model files — adjust the left side to your actual model directory.
+      - C:\Users\Dalton\models:/models:ro
+      # Persistent storage (SQLite, audit log, sandbox workspace)
       - ./storage:/app/storage
       - ./logs:/app/logs
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
+      - ./sandbox:/app/sandbox
+      # llama-server binary — mount the folder that contains llama-server.exe
+      - C:\llama:/llama:ro
+    environment:
+      # Tell the container where llama-server lives inside the container.
+      LLAMA_SERVER_EXECUTABLE: /llama/llama-server.exe
+      # Bind llama-server to all interfaces so the webui service can reach it.
+      LLAMA_SERVER_HOST: 0.0.0.0
+    networks:
+      - localbot-net
 
-  open-webui:
+  # ── LocalBot WebUI API bridge ───────────────────────────────────────────────
+  localbot-webui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        EXTRA: webui
+    container_name: localbot-webui
+    restart: unless-stopped
+    env_file: .env
+    # Use python -m so the entry point is always found regardless of PATH.
+    command: ["python", "-m", "localbot.webui"]
+    ports:
+      - "8080:8080"
+    environment:
+      WEBUI_HOST: 0.0.0.0
+      WEBUI_PORT: 8080
+    depends_on:
+      - localbot
+    networks:
+      - localbot-net
+
+  # ── OpenWebUI ───────────────────────────────────────────────────────────────
+  openwebui:
     image: ghcr.io/open-webui/open-webui:main
+    container_name: openwebui
+    restart: unless-stopped
     ports:
       - "3000:8080"
     environment:
-      # Tell OpenWebUI not to look for a local Ollama instance.
-      OLLAMA_BASE_URL: ""
-      # Pre-configure the LocalBot API connection.
-      OPENAI_API_BASE_URL: "http://localbot-api:8000/v1"
-      OPENAI_API_KEY: "${WEBUI_API_KEY:-localbot}"
+      # Point OpenWebUI at the LocalBot API bridge instead of a real OpenAI key.
+      OPENAI_API_BASE_URL: http://localbot-webui:8080/v1
+      OPENAI_API_KEY: ${WEBUI_API_KEY:-localbot}
+      # Disable Ollama since we are not using it.
+      ENABLE_OLLAMA_API: "false"
     volumes:
-      - open-webui-data:/app/backend/data
+      - openwebui-data:/app/backend/data
     depends_on:
-      localbot-api:
-        condition: service_healthy
-    restart: unless-stopped
+      - localbot-webui
+    networks:
+      - localbot-net
 
 volumes:
-  open-webui-data:
+  openwebui-data:
+
+networks:
+  localbot-net:
+    driver: bridge
