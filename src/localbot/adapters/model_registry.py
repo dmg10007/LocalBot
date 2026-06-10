@@ -42,15 +42,7 @@ class _SlotConfig:
 
 
 class ModelRegistry:
-    """Manages a single active llama-server slot with hot-swap support.
-
-    Usage::
-
-        registry = ModelRegistry()
-        client = await registry.acquire("coding")
-        reply = await client.chat(messages)
-        # idle timer will unload after cfg.idle_unload_seconds of inactivity
-    """
+    """Manages a single active llama-server slot with hot-swap support."""
 
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
@@ -59,7 +51,6 @@ class ModelRegistry:
         self._client: LlamaCppClient | None = None
         self._idle_task: asyncio.Task | None = None
 
-        # Build slot configs from environment, falling back to legacy vars.
         self._slots: dict[SlotName, _SlotConfig] = {
             "general": _SlotConfig(
                 name="general",
@@ -83,16 +74,9 @@ class ModelRegistry:
     # ------------------------------------------------------------------
 
     def is_slot_available(self, slot: SlotName) -> bool:
-        """Return True if the slot has a model path configured."""
         return bool(self._slots[slot].model_path)
 
     async def acquire(self, slot: SlotName) -> LlamaCppClient:
-        """Return a ready LlamaCppClient for *slot*, swapping if necessary.
-
-        Falls back to ``general`` if *slot* is not configured.  Callers
-        that hold the returned client should not cache it across turns —
-        re-acquire each time so the registry can swap freely.
-        """
         if not self.is_slot_available(slot):
             log.debug("Slot '%s' not configured — falling back to general", slot)
             slot = "general"
@@ -109,7 +93,6 @@ class ModelRegistry:
         await self.acquire("general")
 
     async def shutdown(self) -> None:
-        """Stop the active server and cancel the idle timer."""
         self._cancel_idle_timer()
         async with self._lock:
             await self._stop_current()
@@ -121,9 +104,7 @@ class ModelRegistry:
     async def _swap_to(self, slot: SlotName) -> None:
         """Stop the current slot and start *slot*.  Must be called under lock."""
         if self._active_slot is not None:
-            log.info(
-                "[registry] swapping %s → %s", self._active_slot, slot
-            )
+            log.info("[registry] swapping %s → %s", self._active_slot, slot)
         await self._stop_current()
 
         sc = self._slots[slot]
@@ -131,9 +112,8 @@ class ModelRegistry:
             model_path=sc.model_path,
             port=sc.port,
         )
-        # Use cfg.llama_server_client_host (default 127.0.0.1) — NOT
-        # cfg.llama_server_host which is the bind address (0.0.0.0) and
-        # is not a routable destination.
+        # Use llama_server_client_host (127.0.0.1) — NOT llama_server_host
+        # which is the bind address (0.0.0.0) and is not routable.
         client = LlamaCppClient(
             host=cfg.llama_server_client_host,
             port=sc.port,
@@ -141,7 +121,16 @@ class ModelRegistry:
 
         log.info("[registry] starting slot '%s' (port %d)", slot, sc.port)
         await server.start()
-        await client.wait_until_ready(retries=_READY_RETRIES, delay=_READY_DELAY)
+        try:
+            await client.wait_until_ready(
+                retries=_READY_RETRIES,
+                delay=_READY_DELAY,
+                server=server,
+            )
+        except RuntimeError:
+            # Stop the orphaned server process before re-raising.
+            await server.stop()
+            raise
 
         self._server = server
         self._client = client
@@ -149,7 +138,6 @@ class ModelRegistry:
         log.info("[registry] slot '%s' ready", slot)
 
     async def _stop_current(self) -> None:
-        """Gracefully stop the current server/client.  Must be called under lock."""
         if self._client is not None:
             try:
                 await self._client.close()

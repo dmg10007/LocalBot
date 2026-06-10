@@ -10,11 +10,14 @@ import asyncio
 import logging
 import re
 from enum import Enum, auto
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import aiohttp
 
 from localbot.config import cfg
+
+if TYPE_CHECKING:
+    from localbot.adapters.llamacpp_server import LlamaCppServer
 
 log = logging.getLogger(__name__)
 
@@ -29,7 +32,6 @@ class ModelFamily(Enum):
     UNKNOWN = auto()    # Unrecognised — safe defaults applied
 
 
-# Name-pattern → family. Checked in order; first match wins.
 _FAMILY_PATTERNS: list[tuple[re.Pattern[str], ModelFamily]] = [
     (re.compile(r"gemma|glm",        re.I), ModelFamily.GEMMA),
     (re.compile(r"llama",            re.I), ModelFamily.LLAMA),
@@ -39,13 +41,12 @@ _FAMILY_PATTERNS: list[tuple[re.Pattern[str], ModelFamily]] = [
     (re.compile(r"phi",              re.I), ModelFamily.PHI),
 ]
 
-# Stop tokens per family.
 _STOP_TOKENS: dict[ModelFamily, list[str]] = {
     ModelFamily.GEMMA:    ["<end_of_turn>", "<eos>"],
     ModelFamily.LLAMA:    ["<|eot_id|>", "<|end_of_text|>", "<|eom_id|>"],
     ModelFamily.MISTRAL:  ["</s>", "[INST]"],
     ModelFamily.QWEN:     ["<|im_end|>", "<|endoftext|>"],
-    ModelFamily.DEEPSEEK: ["└┘", "<|end_of_sentence|>"],
+    ModelFamily.DEEPSEEK: ["\u2514\u2518", "<|end_of_sentence|>"],
     ModelFamily.PHI:      ["<|end|>", "<|endoftext|>"],
     ModelFamily.UNKNOWN:  [],
 }
@@ -89,21 +90,16 @@ class LlamaCppClient:
         host: str | None = None,
         port: int | None = None,
     ) -> None:
-        # Per-slot overrides; fall back to global cfg when not provided.
-        _host = host or cfg.llama_server_host
+        _host = host or cfg.llama_server_client_host
         _port = port or cfg.llama_server_port
         self._base = f"http://{_host}:{_port}"
         self._session: aiohttp.ClientSession | None = None
         self._family: ModelFamily = ModelFamily.UNKNOWN
         self._model_name: str = "unknown"
-        # Fix #10: tracks whether the server has been confirmed healthy and
-        # model detection has run. Checked in Agent.handle() to skip
-        # wait_until_ready() on every message once the server is up.
         self._is_ready: bool = False
 
     @property
     def is_ready(self) -> bool:
-        """True once the server has passed a health check and model detection."""
         return self._is_ready
 
     def _get_session(self) -> aiohttp.ClientSession:
@@ -117,12 +113,6 @@ class LlamaCppClient:
             self._session = None
 
     async def detect_model(self) -> None:
-        """Query /v1/models and classify the loaded model family.
-
-        Called once after the server is healthy. An env override
-        (LLAMA_SERVER_MODEL_FAMILY) takes priority over auto-detection
-        for fine-tunes or models with unusual filenames.
-        """
         override = cfg.llama_server_model_family.lower().strip()
         if override:
             family_map = {
@@ -168,7 +158,6 @@ class LlamaCppClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """Call /v1/chat/completions with family-appropriate settings."""
         payload: dict[str, Any] = {
             "messages": messages,
             "stream": False,
@@ -205,9 +194,27 @@ class LlamaCppClient:
 
         return data
 
-    async def wait_until_ready(self, retries: int = 20, delay: float = 1.5) -> None:
+    async def wait_until_ready(
+        self,
+        retries: int = 20,
+        delay: float = 1.5,
+        server: "LlamaCppServer | None" = None,
+    ) -> None:
+        """Poll /health until llama-server responds 200.
+
+        If *server* is provided, checks after each failed attempt whether
+        the process has already exited and raises immediately with the
+        exit code rather than waiting out the full timeout.
+        """
         session = self._get_session()
         for attempt in range(retries):
+            # Early-exit: if the process died, no point waiting further.
+            if server is not None and not server.is_running:
+                rc = server.returncode
+                raise RuntimeError(
+                    f"llama-server exited unexpectedly (exit code {rc}) "
+                    f"after {attempt} health-check attempt(s)"
+                )
             try:
                 async with session.get(
                     f"{self._base}/health",
@@ -217,8 +224,6 @@ class LlamaCppClient:
                         log.info("llama-server is ready")
                         if self._family is ModelFamily.UNKNOWN:
                             await self.detect_model()
-                        # Fix #10: mark the client as ready so Agent.handle()
-                        # can skip this probe on subsequent requests.
                         self._is_ready = True
                         return
             except Exception:
