@@ -22,19 +22,15 @@ services:
     restart: unless-stopped
     env_file: .env
     volumes:
-      # Model files — adjust the left side to your actual model directory.
       - C:\Llama\Models:/models:ro
-      # Persistent storage (SQLite, audit log, sandbox workspace)
       - ./storage:/app/storage
       - ./logs:/app/logs
       - ./sandbox:/app/sandbox
-      # llama-server binary — mount the folder that contains llama-server.exe
       - C:\llama:/llama:ro
     environment:
       LLAMA_SERVER_EXECUTABLE: /llama/llama-server.exe
-      # Bind on all interfaces inside the container.
+      # Bind on all interfaces so localbot-webui can reach it.
       LLAMA_SERVER_HOST: 0.0.0.0
-      # But connect via loopback — 0.0.0.0 is a bind addr, not routable.
       LLAMA_SERVER_CLIENT_HOST: 127.0.0.1
     networks:
       - localbot-net
@@ -55,19 +51,11 @@ services:
     environment:
       WEBUI_HOST: 0.0.0.0
       WEBUI_PORT: "8080"
-      LLAMA_SERVER_EXECUTABLE: /llama/llama-server.exe
-      # Bind llama-server on all interfaces.
-      LLAMA_SERVER_HOST: 0.0.0.0
-      # Connect to llama-server via loopback.
-      LLAMA_SERVER_CLIENT_HOST: 127.0.0.1
-      # Separate port range so webui's llama-server doesn't collide
-      # with localbot's ports (8080-8082).
-      SLOT_GENERAL_PORT: "8090"
-      SLOT_CODING_PORT: "8091"
-      SLOT_REASONING_PORT: "8092"
+      # Remote mode: connect to localbot's llama-server over the Docker
+      # bridge network instead of spawning a Windows .exe in a Linux container.
+      LLAMA_REMOTE_HOST: localbot
+      LLAMA_REMOTE_PORT: "8080"
     volumes:
-      - C:\Llama\Models:/models:ro
-      - C:\llama:/llama:ro
       - ./storage:/app/storage
       - ./logs:/app/logs
     depends_on:
