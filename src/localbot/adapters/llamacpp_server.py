@@ -13,7 +13,15 @@ log = logging.getLogger(__name__)
 
 
 class LlamaCppServer:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        model_path: str | None = None,
+        port: int | None = None,
+    ) -> None:
+        # Per-slot overrides; fall back to global cfg when not provided.
+        self._model_path = model_path or cfg.llama_server_model_path
+        self._port = port or cfg.llama_server_port
+
         self._proc: Process | None = None
         # Fix #20: track the background log-reader task so it can be cancelled
         # cleanly when the server is stopped.
@@ -26,9 +34,9 @@ class LlamaCppServer:
         # like <|eot_id|> to leak into responses as literal text.
         cmd = [
             cfg.llama_server_executable,
-            "--model", cfg.llama_server_model_path,
+            "--model", self._model_path,
             "--host", cfg.llama_server_host,
-            "--port", str(cfg.llama_server_port),
+            "--port", str(self._port),
             "--n-gpu-layers", str(cfg.llama_server_n_gpu_layers),
             "--ctx-size", str(cfg.llama_server_ctx_size),
         ]
