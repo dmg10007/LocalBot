@@ -80,8 +80,6 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
 
         if cfg.llama_remote_host:
             # ── Remote mode ──────────────────────────────────────────────────
-            # Point a bare LlamaCppClient at the localbot container.
-            # No subprocess is spawned — the model is already loaded there.
             log.info(
                 "Remote llama-server mode: %s:%d",
                 cfg.llama_remote_host,
@@ -179,12 +177,11 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
     _bearer = HTTPBearer(auto_error=False)
 
     def _get_user_id(
-        request: Request,
         creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
     ) -> str:
+        """Validate Bearer token and return an internal user_id string."""
         if API_KEY is None:
-            client_ip = (request.client.host if request.client else "unknown")
-            return f"{USER_PREFIX}guest:{client_ip}"
+            return f"{USER_PREFIX}guest"
         if creds is None or creds.credentials != API_KEY:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -203,7 +200,7 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
         return {"status": "ok"}
 
     # ------------------------------------------------------------------
-    # GET /v1/models  — no auth required (OpenWebUI polls this unauthenticated)
+    # GET /v1/models  — no auth (OpenWebUI polls this unauthenticated)
     # ------------------------------------------------------------------
     @app.get("/v1/models")
     async def list_models() -> dict:
@@ -228,7 +225,13 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
     async def chat_completions(
         request: Request,
         user_id: str = Depends(_get_user_id),
-    ) -> "fastapi.Response":  # type: ignore[name-defined]
+    ) -> fastapi.Response:
+        """OpenAI-compatible chat completions endpoint.
+
+        `request` is FastAPI's special `Request` type — it must be the
+        first positional parameter so FastAPI injects it directly rather
+        than trying to parse it from the query string or body.
+        """
         if not getattr(request.app.state, "ready", False):
             raise HTTPException(
                 status_code=503,
@@ -250,7 +253,8 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
             raise HTTPException(status_code=400, detail="No user message found.")
 
         _agent: Agent = request.app.state.agent
-        reply_future: asyncio.Future[str] = asyncio.get_event_loop().create_future()
+        loop = asyncio.get_event_loop()
+        reply_future: asyncio.Future[str] = loop.create_future()
 
         async def _run() -> None:
             try:

@@ -2,10 +2,11 @@
 # Build arg EXTRA installs an optional extras group (e.g. "webui").
 # Leave blank for the default Discord bot image.
 #
-# The llama stage downloads the pre-built Ubuntu x64 llama-server binary
-# so the container never needs to run the Windows .exe through WSL interop.
+# The llama stage downloads the pre-built Ubuntu x64 llama-server release
+# and copies the binary + all shared libraries into the final image so the
+# dynamic linker can find libllama-server-impl.so at runtime.
 
-# ── Stage 1: download llama-server Linux binary ───────────────────────────
+# ── Stage 1: download llama-server + shared libs ────────────────────────
 FROM python:3.11-slim AS llama
 
 ARG LLAMA_VERSION=b9591
@@ -14,8 +15,9 @@ ARG LLAMA_URL=https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_VE
 RUN apt-get update && apt-get install -y --no-install-recommends curl tar \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl -fsSL "$LLAMA_URL" | tar -xz -C /tmp \
-    && find /tmp -name 'llama-server' -exec install -m 755 {} /usr/local/bin/llama-server \;
+# Extract the full release into /opt/llama so we can copy everything.
+RUN mkdir -p /opt/llama \
+    && curl -fsSL "$LLAMA_URL" | tar -xz --strip-components=1 -C /opt/llama
 
 # ── Stage 2: application image ────────────────────────────────────────────
 FROM python:3.11-slim AS base
@@ -24,8 +26,12 @@ ARG EXTRA=""
 
 WORKDIR /app
 
-# Copy llama-server binary from the llama stage
-COPY --from=llama /usr/local/bin/llama-server /usr/local/bin/llama-server
+# Copy the llama-server binary and all companion shared libraries.
+COPY --from=llama /opt/llama/llama-server /usr/local/bin/llama-server
+COPY --from=llama /opt/llama/*.so* /usr/local/lib/
+
+# Ensure the dynamic linker picks up the new .so files.
+RUN ldconfig
 
 # Install build deps (needed for some aiohttp/lxml wheels on slim)
 RUN apt-get update && apt-get install -y --no-install-recommends \
