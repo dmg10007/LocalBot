@@ -28,6 +28,11 @@ log = logging.getLogger(__name__)
 
 SlotName = Literal["general", "coding", "reasoning"]
 
+# How long to wait for llama-server to become healthy after launch.
+# 120 retries × 1 s = 2 minutes — enough for an 8B Q4 model on CPU.
+_READY_RETRIES = 120
+_READY_DELAY = 1.0
+
 
 @dataclass
 class _SlotConfig:
@@ -133,7 +138,7 @@ class ModelRegistry:
 
         log.info("[registry] starting slot '%s' (port %d)", slot, sc.port)
         await server.start()
-        await client.wait_until_ready(retries=30, delay=1.0)
+        await client.wait_until_ready(retries=_READY_RETRIES, delay=_READY_DELAY)
 
         self._server = server
         self._client = client
