@@ -3,17 +3,36 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, TYPE_CHECKING
+from typing import Any, Literal, TYPE_CHECKING
 
 from localbot.config import cfg
 from localbot.tools import search, reddit, time_tools
 from localbot.tools.log_reader import read_logs
 from localbot.tools.scheduler_tools import SCHEDULER_TOOL_SCHEMAS
+from localbot.tools.filesystem import (
+    FILESYSTEM_TOOL_SCHEMAS,
+    read_file,
+    write_file,
+    list_directory,
+    apply_patch,
+    search_in_files,
+)
+from localbot.tools.github_tools import (
+    GITHUB_TOOL_SCHEMAS,
+    github_read_file,
+    github_list_directory,
+    github_create_branch,
+    github_commit_files,
+    github_create_pull_request,
+    github_list_pull_requests,
+)
 
 if TYPE_CHECKING:
     from localbot.tools.scheduler_tools import SchedulerTools
 
 log = logging.getLogger(__name__)
+
+WorkspaceMode = Literal["local", "github", "both", None]
 
 # Static schemas for search / time / diagnostics tools.
 # Descriptions are intentionally narrow — small models over-call tools
@@ -107,17 +126,26 @@ _STATIC_SCHEMAS: list[dict[str, Any]] = [
 ]
 
 
-def build_tool_schemas(include_scheduler: bool = False) -> list[dict[str, Any]]:
+def build_tool_schemas(
+    include_scheduler: bool = False,
+    workspace_mode: WorkspaceMode = None,
+) -> list[dict[str, Any]]:
     """Return the full list of tool schemas for a request.
 
     Args:
         include_scheduler: Whether to include schedule_job / cancel_job /
-            list_jobs schemas. Pass True when a live SchedulerService is
-            available for this request.
+            list_jobs schemas.
+        workspace_mode: 'local' adds filesystem tools; 'github' adds GitHub
+            tools; 'both' adds both sets; None adds neither.
     """
+    schemas = list(_STATIC_SCHEMAS)
     if include_scheduler:
-        return _STATIC_SCHEMAS + SCHEDULER_TOOL_SCHEMAS
-    return _STATIC_SCHEMAS
+        schemas += SCHEDULER_TOOL_SCHEMAS
+    if workspace_mode in ("local", "both") and cfg.sandbox_root:
+        schemas += FILESYSTEM_TOOL_SCHEMAS
+    if workspace_mode in ("github", "both") and cfg.github_token:
+        schemas += GITHUB_TOOL_SCHEMAS
+    return schemas
 
 
 async def dispatch(
@@ -130,23 +158,16 @@ async def dispatch(
 
     Scheduler tools are routed to *scheduler_tools* when provided; all
     other tools are handled inline here.
-
-    Args:
-        tool_name: Name of the tool to invoke.
-        args: Parsed JSON arguments from the LLM tool call.
-        scheduler_tools: Per-request scheduler tool instance, if available.
-        requesting_user_id: Discord user ID of the requester.  Required
-            for read_logs scope enforcement.
     """
     try:
         async with asyncio.timeout(cfg.tool_timeout_seconds):
-            # Scheduler tools: delegate to the per-request SchedulerTools instance.
+            # Scheduler tools.
             if scheduler_tools is not None:
                 result = await scheduler_tools.dispatch(tool_name, args)
                 if result is not None:
                     return result
 
-            # Static tools.
+            # Static / web tools.
             if tool_name == "web_search":
                 return await search.web_search(args["query"])
             elif tool_name == "reddit_search":
@@ -161,6 +182,58 @@ async def dispatch(
                     level=args.get("level"),
                     limit=int(args.get("limit", 50)),
                 )
+
+            # Local filesystem tools.
+            elif tool_name == "read_file":
+                return read_file(args["path"])
+            elif tool_name == "write_file":
+                return write_file(args["path"], args["content"])
+            elif tool_name == "list_directory":
+                return list_directory(args.get("path", "."))
+            elif tool_name == "apply_patch":
+                return apply_patch(args["path"], args["patch"])
+            elif tool_name == "search_in_files":
+                return search_in_files(
+                    args["pattern"],
+                    path=args.get("path", "."),
+                    file_glob=args.get("file_glob", "*"),
+                )
+
+            # GitHub tools.
+            elif tool_name == "github_read_file":
+                return await github_read_file(
+                    args["owner"], args["repo"], args["path"],
+                    ref=args.get("ref", "HEAD"),
+                )
+            elif tool_name == "github_list_directory":
+                return await github_list_directory(
+                    args["owner"], args["repo"],
+                    path=args.get("path", ""),
+                    ref=args.get("ref", "HEAD"),
+                )
+            elif tool_name == "github_create_branch":
+                return await github_create_branch(
+                    args["owner"], args["repo"], args["branch"],
+                    from_branch=args.get("from_branch", "main"),
+                )
+            elif tool_name == "github_commit_files":
+                return await github_commit_files(
+                    args["owner"], args["repo"], args["branch"],
+                    args["message"], args["files"],
+                )
+            elif tool_name == "github_create_pull_request":
+                return await github_create_pull_request(
+                    args["owner"], args["repo"], args["title"],
+                    args["head"],
+                    base=args.get("base", "main"),
+                    body=args.get("body", ""),
+                )
+            elif tool_name == "github_list_pull_requests":
+                return await github_list_pull_requests(
+                    args["owner"], args["repo"],
+                    state=args.get("state", "open"),
+                )
+
             else:
                 return f"Unknown tool: {tool_name}"
     except asyncio.TimeoutError:

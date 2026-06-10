@@ -10,10 +10,9 @@ from typing import Callable, Awaitable
 
 import discord
 
-from localbot.adapters.llamacpp_client import LlamaCppClient
 from localbot.adapters.llamacpp_downloader import download_and_install
-from localbot.adapters.llamacpp_server import LlamaCppServer
 from localbot.adapters.llamacpp_updater import check_for_update
+from localbot.adapters.model_registry import ModelRegistry
 from localbot.agent import Agent
 from localbot.config import cfg
 from localbot.scheduler.service import SchedulerService
@@ -61,8 +60,6 @@ async def _cmd_timezone_set(bot: "LocalBot", message: discord.Message, user_id: 
     if not m:
         return False
     tz = m.group(1).strip()
-    # Fix #1: let the store validate the timezone — catches invalid values in
-    # one place. Redundant pre-validation against available_timezones() removed.
     try:
         set_user_timezone(user_id, tz)
     except ValueError:
@@ -98,6 +95,20 @@ async def _cmd_clear(bot: "LocalBot", message: discord.Message, user_id: str, te
     return True
 
 
+async def _cmd_model_status(bot: "LocalBot", message: discord.Message, user_id: str, text: str) -> bool:
+    if text.lower() not in ("model status", "model"):
+        return False
+    registry = bot._registry
+    active = registry._active_slot or "none"
+    slots = []
+    for name in ("general", "coding", "reasoning"):
+        available = registry.is_slot_available(name)  # type: ignore[arg-type]
+        status = "active" if name == active else ("available" if available else "not configured")
+        slots.append(f"  `{name}` — {status}")
+    await message.channel.send("**Model slots:**\n" + "\n".join(slots))
+    return True
+
+
 async def _cmd_help(bot: "LocalBot", message: discord.Message, user_id: str, text: str) -> bool:
     if text.lower() not in ("help", "/help"):
         return False
@@ -108,15 +119,17 @@ async def _cmd_help(bot: "LocalBot", message: discord.Message, user_id: str, tex
         "`timezone set <IANA>` — Set your timezone (e.g. `America/New_York`)\n"
         "`timezone show` — Show your current timezone\n"
         "`time now` — Show current time in your timezone\n"
+        "`model status` — Show active and configured model slots\n"
         "`clear` — Clear your conversation history\n"
         "\nFor scheduled reminders, just ask naturally:\n"
-        "> *Remind me every morning at 8am to review my task list*"
+        "> *Remind me every morning at 8am to review my task list*\n"
+        "\nFor coding tasks, just describe what you need:\n"
+        "> *Fix the bug in src/app.py line 42*\n"
+        "> *Commit the updated README to my repo and open a PR*"
     )
     return True
 
 
-# Fix #12: dispatch table replaces the flat if/elif chain. Adding a new command
-# is now a matter of writing a handler function and appending it here.
 _COMMAND_HANDLERS: list[_CommandHandler] = [
     _cmd_jobs_list,
     _cmd_jobs_cancel,
@@ -124,6 +137,7 @@ _COMMAND_HANDLERS: list[_CommandHandler] = [
     _cmd_timezone_show,
     _cmd_time_now,
     _cmd_clear,
+    _cmd_model_status,
     _cmd_help,
 ]
 
@@ -134,19 +148,12 @@ class LocalBot(discord.Client):
         intents.message_content = True
         super().__init__(intents=intents)
 
-        self._server = LlamaCppServer()
-        self._client = LlamaCppClient()
+        self._registry = ModelRegistry()
         self._scheduler = SchedulerService(self._send_scheduled)
-        # Pass the live SchedulerService into Agent so the LLM can actually
-        # create, cancel, and list jobs via tool calls.
-        self._agent = Agent(self._server, self._client, scheduler=self._scheduler)
+        self._agent = Agent(self._registry, scheduler=self._scheduler)
         self._backend_ready = False
         self._last_request: dict[str, float] = {}
         self._backend_task: asyncio.Task | None = None
-
-    # ------------------------------------------------------------------
-    # Discord events
-    # ------------------------------------------------------------------
 
     async def on_ready(self) -> None:
         log.info("Logged in as %s (id=%s)", self.user, self.user.id if self.user else "?")
@@ -163,8 +170,7 @@ class LocalBot(discord.Client):
     async def _start_backend(self) -> None:
         try:
             await _check_for_llama_update()
-            await self._server.start()
-            await self._client.wait_until_ready()
+            await self._registry.warm_general()
             self._scheduler.start()
             self._backend_ready = True
             log.info("Backend ready")
@@ -218,29 +224,18 @@ class LocalBot(discord.Client):
 
     async def close(self) -> None:
         self._scheduler.stop()
-        await self._client.close()
         await search_module.close_session()
         await reddit_module.close_session()
-        await self._server.stop()
+        await self._registry.shutdown()
         await super().close()
 
-    # ------------------------------------------------------------------
-    # Built-in command handler
-    # ------------------------------------------------------------------
-
     async def _handle_command(self, message: discord.Message, user_id: str, text: str) -> bool:
-        """Iterate through command handlers; return True if one matched."""
         for handler in _COMMAND_HANDLERS:
             if await handler(self, message, user_id, text):
                 return True
         return False
 
-    # ------------------------------------------------------------------
-    # Scheduler callback
-    # ------------------------------------------------------------------
-
     async def _send_scheduled(self, user_id: str, prompt: str) -> None:
-        """Called by the scheduler to deliver a prompt to a user via DM."""
         try:
             discord_user = await self.fetch_user(int(user_id))
             dm = await discord_user.create_dm()
@@ -257,15 +252,10 @@ class LocalBot(discord.Client):
 # ---------------------------------------------------------------------------
 
 def _prompt_stdin(prompt: str) -> str:
-    """Read a line from stdin synchronously (run in a thread executor)."""
     return input(prompt)
 
 
 async def _ask_terminal(prompt: str, timeout: float) -> str | None:
-    """Print *prompt* and read one line from stdin without blocking the loop.
-
-    Returns the stripped response, or ``None`` on timeout or EOF.
-    """
     loop = asyncio.get_event_loop()
     try:
         return await asyncio.wait_for(
@@ -273,37 +263,14 @@ async def _ask_terminal(prompt: str, timeout: float) -> str | None:
             timeout=timeout,
         )
     except asyncio.TimeoutError:
-        print()  # newline so the next log line isn't on the prompt line
+        print()
         return None
     except EOFError:
-        # Non-interactive stdin (e.g. piped input / CI); treat as "no".
         return None
 
 
-# ---------------------------------------------------------------------------
-# Update check helper (module-level so it is easy to test in isolation)
-# ---------------------------------------------------------------------------
-
 async def _check_for_llama_update(*, _already_updated: bool = False) -> None:
-    """Run the llama.cpp update check and, if an update is available, offer
-    to install it.
-
-    Flow
-    ----
-    1. Query GitHub Releases API for the latest build number.
-    2. Compare against the installed build (via ``llama-server --version``).
-    3. If up to date, log INFO and return.
-    4. If an update is available:
-       a. If ``LLAMA_UPDATE_AUTO=true``, install immediately.
-       b. Otherwise, prompt the terminal operator with a ``[y/N]`` question
-          (waits up to ``LLAMA_UPDATE_PROMPT_TIMEOUT_SECONDS`` seconds before
-          continuing without updating).
-    5. On successful install, re-run the check once so the post-install build
-       number is logged (guarded by ``_already_updated`` to prevent loops).
-
-    Never raises — a failed check or failed download is logged as a warning
-    and startup continues normally.  Controlled by ``cfg.llama_update_check``.
-    """
+    """Run the llama.cpp update check and optionally install the update."""
     if not cfg.llama_update_check:
         log.debug("llama.cpp update check disabled (LLAMA_UPDATE_CHECK=false)")
         return
@@ -330,11 +297,8 @@ async def _check_for_llama_update(*, _already_updated: bool = False) -> None:
     )
 
     if _already_updated:
-        # Prevent an infinite loop if the post-install version still doesn't
-        # match (e.g. partial extraction).
         return
 
-    # ── Decide whether to install ─────────────────────────────────────────
     if cfg.llama_update_auto:
         do_update = True
         log.info("LLAMA_UPDATE_AUTO=true — installing update automatically.")
@@ -353,7 +317,6 @@ async def _check_for_llama_update(*, _already_updated: bool = False) -> None:
         log.info("Update declined — continuing with current version.")
         return
 
-    # ── Download and install ───────────────────────────────────────────────
     install_dir = Path(cfg.llama_server_executable).parent
     log.info("Installing llama.cpp b%s into %s ...", info.latest, install_dir)
     result = await download_and_install(
@@ -363,7 +326,6 @@ async def _check_for_llama_update(*, _already_updated: bool = False) -> None:
 
     if result.ok:
         log.info("llama.cpp updated successfully: %s", result.message)
-        # Re-run the check once to log the confirmed installed version.
         await _check_for_llama_update(_already_updated=True)
     else:
         log.warning("llama.cpp update failed: %s — continuing with current version.", result.message)

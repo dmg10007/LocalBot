@@ -1,219 +1,189 @@
 """Hot-swap model registry.
 
-Manages named model slots (general, coding, reasoning). Because the host
-machine can only run one ~7-9B model at a time, only a single
-llama-server process is live at any moment.  Switching slots stops the
-current server, starts the new one, then restarts an idle timer that
-reloads the general (lightweight) model after IDLE_UNLOAD_SECONDS of
-inactivity.
+Manages a single active llama-server slot.  At most one slot runs at a
+time — swapping kills the current process, starts the new one, then
+resets the idle-unload timer.
 
-Slot configuration is read from environment variables:
+Slot names
+----------
+``general``   — lightweight always-on fallback (Llama 3.2 3B, etc.)
+``coding``    — code-optimised model (Qwen2.5-Coder, etc.)
+``reasoning`` — chain-of-thought model (DeepSeek-R1, etc.)
 
-  SLOT_GENERAL_MODEL=models/llama-3.2-3b-instruct.gguf
-  SLOT_GENERAL_PORT=8080
-  SLOT_CODING_MODEL=models/qwen2.5-coder-7b-instruct.gguf
-  SLOT_CODING_PORT=8081
-  SLOT_REASONING_MODEL=models/deepseek-r1-8b.gguf
-  SLOT_REASONING_PORT=8082
-
-A slot whose MODEL path is empty is disabled; requests that would
-route to it fall back to the general slot automatically.
-
-All public methods are coroutine-safe: a single asyncio.Lock serialises
-slot switches so that concurrent requests queue cleanly.
+A slot whose model path is empty/None is disabled; requests that would
+route there fall back to ``general``.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import Literal
 
 from localbot.adapters.llamacpp_client import LlamaCppClient
 from localbot.adapters.llamacpp_server import LlamaCppServer
 from localbot.config import cfg
 
-if TYPE_CHECKING:
-    pass
-
 log = logging.getLogger(__name__)
+
+SlotName = Literal["general", "coding", "reasoning"]
 
 
 @dataclass
-class SlotConfig:
-    name: str
+class _SlotConfig:
+    name: SlotName
     model_path: str
     port: int
-    n_gpu_layers: int
-    ctx_size: int
-    threads: int
-    extra_args: str
-
-    @property
-    def enabled(self) -> bool:
-        return bool(self.model_path)
 
 
 class ModelRegistry:
-    """Lifecycle manager for named model slots with hot-swap support."""
+    """Manages a single active llama-server slot with hot-swap support.
+
+    Usage::
+
+        registry = ModelRegistry()
+        client = await registry.acquire("coding")
+        reply = await client.chat(messages)
+        # idle timer will unload after cfg.idle_unload_seconds of inactivity
+    """
 
     def __init__(self) -> None:
-        self._slots: dict[str, SlotConfig] = self._build_slots()
-        self._active_slot: str = "general"
+        self._lock = asyncio.Lock()
+        self._active_slot: SlotName | None = None
         self._server: LlamaCppServer | None = None
         self._client: LlamaCppClient | None = None
-        self._lock = asyncio.Lock()
         self._idle_task: asyncio.Task | None = None
+
+        # Build slot configs from environment, falling back to legacy vars.
+        self._slots: dict[SlotName, _SlotConfig] = {
+            "general": _SlotConfig(
+                name="general",
+                model_path=cfg.slot_general_model,
+                port=cfg.slot_general_port,
+            ),
+            "coding": _SlotConfig(
+                name="coding",
+                model_path=cfg.slot_coding_model,
+                port=cfg.slot_coding_port,
+            ),
+            "reasoning": _SlotConfig(
+                name="reasoning",
+                model_path=cfg.slot_reasoning_model,
+                port=cfg.slot_reasoning_port,
+            ),
+        }
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    @property
-    def active_slot(self) -> str:
-        return self._active_slot
+    def is_slot_available(self, slot: SlotName) -> bool:
+        """Return True if the slot has a model path configured."""
+        return bool(self._slots[slot].model_path)
 
-    @property
-    def client(self) -> LlamaCppClient:
-        """The client for the currently active slot. Always valid after ensure_slot()."""
-        if self._client is None:
-            raise RuntimeError("ModelRegistry: no client — call ensure_slot() first")
-        return self._client
+    async def acquire(self, slot: SlotName) -> LlamaCppClient:
+        """Return a ready LlamaCppClient for *slot*, swapping if necessary.
 
-    async def ensure_slot(self, slot: str) -> LlamaCppClient:
-        """Guarantee that *slot* is the active running server.
-
-        If a different slot is active it is stopped first (hot-swap).
-        Returns the ready LlamaCppClient for the new slot.
-        Concurrent callers queue behind the internal lock.
+        Falls back to ``general`` if *slot* is not configured.  Callers
+        that hold the returned client should not cache it across turns —
+        re-acquire each time so the registry can swap freely.
         """
-        resolved = self._resolve(slot)
-        async with self._lock:
-            if self._active_slot == resolved and self._client is not None and self._client.is_ready:
-                self._reset_idle_timer()
-                return self._client
+        if not self.is_slot_available(slot):
+            log.debug("Slot '%s' not configured — falling back to general", slot)
+            slot = "general"
 
-            await self._stop_active()
-            await self._start_slot(resolved)
+        async with self._lock:
+            if self._active_slot != slot:
+                await self._swap_to(slot)
             self._reset_idle_timer()
-            return self._client  # type: ignore[return-value]
+            assert self._client is not None
+            return self._client
 
-    async def start_general(self) -> None:
-        """Start the general slot on initial bot startup."""
-        await self.ensure_slot("general")
+    async def warm_general(self) -> None:
+        """Start the general slot at boot so the bot is immediately ready."""
+        await self.acquire("general")
 
-    async def stop_all(self) -> None:
-        """Gracefully stop whichever server is currently running."""
-        if self._idle_task and not self._idle_task.done():
-            self._idle_task.cancel()
+    async def shutdown(self) -> None:
+        """Stop the active server and cancel the idle timer."""
+        self._cancel_idle_timer()
         async with self._lock:
-            await self._stop_active()
-
-    def slot_enabled(self, slot: str) -> bool:
-        return self._slots.get(slot, SlotConfig("", "", 0, 0, 0, 0, "")).enabled
+            await self._stop_current()
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Internal
     # ------------------------------------------------------------------
 
-    def _resolve(self, slot: str) -> str:
-        """Return *slot* if enabled, otherwise fall back to 'general'."""
-        if slot in self._slots and self._slots[slot].enabled:
-            return slot
-        if slot != "general":
-            log.info("Slot '%s' not configured — falling back to 'general'", slot)
-        return "general"
+    async def _swap_to(self, slot: SlotName) -> None:
+        """Stop the current slot and start *slot*.  Must be called under lock."""
+        if self._active_slot is not None:
+            log.info(
+                "[registry] swapping %s → %s", self._active_slot, slot
+            )
+        await self._stop_current()
 
-    async def _stop_active(self) -> None:
-        if self._client is not None:
-            await self._client.close()
-            self._client = None
-        if self._server is not None:
-            await self._server.stop()
-            self._server = None
-
-    async def _start_slot(self, slot: str) -> None:
         sc = self._slots[slot]
-        log.info("[ModelRegistry] Loading slot '%s' (%s)", slot, sc.model_path)
         server = LlamaCppServer(
             model_path=sc.model_path,
             port=sc.port,
-            n_gpu_layers=sc.n_gpu_layers,
-            ctx_size=sc.ctx_size,
-            threads=sc.threads,
-            extra_args=sc.extra_args,
         )
-        client = LlamaCppClient(host=cfg.llama_server_host, port=sc.port)
+        client = LlamaCppClient(
+            host=cfg.llama_server_host,
+            port=sc.port,
+        )
+
+        log.info("[registry] starting slot '%s' (port %d)", slot, sc.port)
         await server.start()
-        await client.wait_until_ready(retries=20, delay=1.5)
+        await client.wait_until_ready(retries=30, delay=1.0)
+
         self._server = server
         self._client = client
         self._active_slot = slot
-        log.info("[ModelRegistry] Slot '%s' is ready", slot)
+        log.info("[registry] slot '%s' ready", slot)
+
+    async def _stop_current(self) -> None:
+        """Gracefully stop the current server/client.  Must be called under lock."""
+        if self._client is not None:
+            try:
+                await self._client.close()
+            except Exception:
+                log.exception("[registry] error closing client for slot '%s'", self._active_slot)
+            self._client = None
+        if self._server is not None:
+            try:
+                await self._server.stop()
+            except Exception:
+                log.exception("[registry] error stopping server for slot '%s'", self._active_slot)
+            self._server = None
+        self._active_slot = None
+
+    # ------------------------------------------------------------------
+    # Idle-unload timer
+    # ------------------------------------------------------------------
 
     def _reset_idle_timer(self) -> None:
-        if self._idle_task and not self._idle_task.done():
-            self._idle_task.cancel()
-        self._idle_task = asyncio.create_task(self._idle_unload())
-        self._idle_task.add_done_callback(self._on_idle_task_done)
+        self._cancel_idle_timer()
+        if cfg.idle_unload_seconds > 0:
+            self._idle_task = asyncio.create_task(self._idle_worker())
+            self._idle_task.add_done_callback(self._on_idle_task_done)
 
-    async def _idle_unload(self) -> None:
+    def _cancel_idle_timer(self) -> None:
+        if self._idle_task is not None and not self._idle_task.done():
+            self._idle_task.cancel()
+        self._idle_task = None
+
+    async def _idle_worker(self) -> None:
         await asyncio.sleep(cfg.idle_unload_seconds)
-        if self._active_slot == "general":
-            return
-        log.info(
-            "[ModelRegistry] Idle timeout (%ds) — swapping back to 'general'",
-            cfg.idle_unload_seconds,
-        )
         async with self._lock:
-            await self._stop_active()
-            await self._start_slot("general")
+            if self._active_slot in ("coding", "reasoning"):
+                log.info(
+                    "[registry] idle timeout — unloading '%s', reloading 'general'",
+                    self._active_slot,
+                )
+                await self._swap_to("general")
 
     def _on_idle_task_done(self, task: asyncio.Task) -> None:
         if not task.cancelled() and task.exception() is not None:
             log.exception(
-                "[ModelRegistry] Idle unload task failed",
+                "[registry] idle worker raised unexpectedly",
                 exc_info=task.exception(),
             )
-
-    # ------------------------------------------------------------------
-    # Slot configuration builder
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _build_slots() -> dict[str, SlotConfig]:
-        """Read SLOT_<NAME>_* env vars and return a slot config dict.
-
-        The general slot always exists and falls back to the legacy
-        LLAMA_SERVER_* variables so that existing .env files continue
-        to work without modification.
-        """
-        return {
-            "general": SlotConfig(
-                name="general",
-                model_path=cfg.slot_general_model,
-                port=cfg.slot_general_port,
-                n_gpu_layers=cfg.llama_server_n_gpu_layers,
-                ctx_size=cfg.llama_server_ctx_size,
-                threads=cfg.llama_server_threads,
-                extra_args=cfg.llama_server_extra_args,
-            ),
-            "coding": SlotConfig(
-                name="coding",
-                model_path=cfg.slot_coding_model,
-                port=cfg.slot_coding_port,
-                n_gpu_layers=cfg.llama_server_n_gpu_layers,
-                ctx_size=cfg.llama_server_ctx_size,
-                threads=cfg.llama_server_threads,
-                extra_args=cfg.llama_server_extra_args,
-            ),
-            "reasoning": SlotConfig(
-                name="reasoning",
-                model_path=cfg.slot_reasoning_model,
-                port=cfg.slot_reasoning_port,
-                n_gpu_layers=cfg.llama_server_n_gpu_layers,
-                ctx_size=cfg.llama_server_ctx_size,
-                threads=cfg.llama_server_threads,
-                extra_args=cfg.llama_server_extra_args,
-            ),
-        }
