@@ -1,0 +1,87 @@
+# LocalBot — full stack
+# Starts the Discord bot, the OpenWebUI API bridge, and OpenWebUI itself.
+#
+# Prerequisites:
+#   1. Copy .env.example to .env and fill in your values.
+#   2. Place your GGUF model file(s) in a local folder and set
+#      SLOT_*_MODEL paths to match the container path (see volumes below).
+#
+# Usage:
+#   docker compose up -d          # start all services
+#   docker compose logs -f        # stream logs
+#   docker compose down           # stop and remove containers
+
+services:
+
+  # ── LocalBot (Discord bot + background scheduler) ──────────────────────────
+  localbot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: localbot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # Model files — adjust the left side to your actual model directory.
+      - C:\Users\Dalton\models:/models:ro
+      # Persistent storage (SQLite, audit log, sandbox workspace)
+      - ./storage:/app/storage
+      - ./logs:/app/logs
+      - ./sandbox:/app/sandbox
+      # llama-server binary — mount the folder that contains llama-server.exe
+      - C:\llama:/llama:ro
+    environment:
+      # Tell the container where llama-server lives inside the container.
+      LLAMA_SERVER_EXECUTABLE: /llama/llama-server.exe
+      # Bind llama-server to all interfaces so the webui service can reach it.
+      LLAMA_SERVER_HOST: 0.0.0.0
+    networks:
+      - localbot-net
+
+  # ── LocalBot WebUI API bridge ───────────────────────────────────────────────
+  localbot-webui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        EXTRA: webui
+    container_name: localbot-webui
+    restart: unless-stopped
+    env_file: .env
+    command: localbot-webui
+    ports:
+      - "8080:8080"
+    environment:
+      WEBUI_HOST: 0.0.0.0
+      WEBUI_PORT: 8080
+    depends_on:
+      - localbot
+    networks:
+      - localbot-net
+
+  # ── OpenWebUI ───────────────────────────────────────────────────────────────
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: openwebui
+    restart: unless-stopped
+    ports:
+      - "3000:8080"
+    environment:
+      # Point OpenWebUI at the LocalBot API bridge instead of a real OpenAI key.
+      OPENAI_API_BASE_URL: http://localbot-webui:8080/v1
+      OPENAI_API_KEY: ${WEBUI_API_KEY:-localbot}
+      # Disable Ollama since we are not using it.
+      ENABLE_OLLAMA_API: "false"
+    volumes:
+      - openwebui-data:/app/backend/data
+    depends_on:
+      - localbot-webui
+    networks:
+      - localbot-net
+
+volumes:
+  openwebui-data:
+
+networks:
+  localbot-net:
+    driver: bridge
