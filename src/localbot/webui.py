@@ -31,6 +31,7 @@ import logging
 import os
 import time
 import uuid
+from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 log = logging.getLogger(__name__)
@@ -77,45 +78,29 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
     USER_PREFIX: str = os.environ.get("WEBUI_USER_PREFIX", "webui:")
 
     # ------------------------------------------------------------------
-    # Shared bot state (initialised on startup)
+    # Lifespan (replaces deprecated @app.on_event handlers)
     # ------------------------------------------------------------------
-    registry: ModelRegistry | None = None
-    scheduler: SchedulerService | None = None
-    agent: Agent | None = None
-
-    app = fastapi.FastAPI(
-        title="LocalBot OpenAI-compatible API",
-        version="0.1.0",
-        docs_url="/docs",
-    )
-
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
-    # ------------------------------------------------------------------
-    # Lifespan
-    # ------------------------------------------------------------------
-    @app.on_event("startup")
-    async def _startup() -> None:
-        nonlocal registry, scheduler, agent
+    @asynccontextmanager
+    async def lifespan(app: fastapi.FastAPI) -> AsyncIterator[None]:  # noqa: ARG001
+        # ---- startup ----
         init_db()
         registry = ModelRegistry()
         scheduler = SchedulerService(_null_send)
-        agent = Agent(registry, scheduler=scheduler)
+        _agent = Agent(registry, scheduler=scheduler)
         await registry.warm_general()
         scheduler.start()
         log.info("LocalBot webui ready")
 
-    @app.on_event("shutdown")
-    async def _shutdown() -> None:
-        if scheduler:
-            scheduler.stop()
-        if registry:
-            await registry.shutdown()
+        # Store on app.state so routes can access if needed in future.
+        app.state.registry = registry
+        app.state.scheduler = scheduler
+        app.state.agent = _agent
+
+        yield
+
+        # ---- shutdown ----
+        scheduler.stop()
+        await registry.shutdown()
         from localbot.tools import search as s, reddit as r
         await s.close_session()
         await r.close_session()
@@ -127,6 +112,20 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
             "implemented; extend _null_send or integrate a push channel.",
             user_id,
         )
+
+    app = fastapi.FastAPI(
+        title="LocalBot OpenAI-compatible API",
+        version="0.1.0",
+        docs_url="/docs",
+        lifespan=lifespan,
+    )
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
     # ------------------------------------------------------------------
     # Auth dependency
@@ -204,14 +203,15 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
         if not user_text:
             raise HTTPException(status_code=400, detail="No user message found.")
 
-        if agent is None:
+        _agent: Agent = request.app.state.agent
+        if _agent is None:
             raise HTTPException(status_code=503, detail="Agent not ready.")
 
         reply_future: asyncio.Future[str] = asyncio.get_event_loop().create_future()
 
         async def _run() -> None:
             try:
-                result = await agent.handle(user_id, user_text)
+                result = await _agent.handle(user_id, user_text)
                 reply_future.set_result(result)
             except Exception as exc:  # noqa: BLE001
                 reply_future.set_exception(exc)
