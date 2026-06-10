@@ -13,6 +13,7 @@ A lightweight Discord DM bot that runs a local LLM via [llama.cpp](https://githu
 - **Model-agnostic inference** — auto-detects model family once on startup and caches the result; swap models by changing one line in `.env`
 - **Thinking model support** — automatically strips `<think>` blocks for reasoning models (Gemma, DeepSeek, Qwen)
 - **Intent-based slot routing** — agent routes each request to the appropriate model slot (`general`, `coding`, `reasoning`) based on message intent
+- **OpenWebUI interface** — optional browser-based chat UI served via a local FastAPI layer; appears as selectable models in the OpenWebUI model picker
 - **Rate limiting** — per-user cooldown with bounded memory; stale entries are automatically evicted so the table never grows unboundedly
 - **Self-healing** — detects llama-server crashes and restarts automatically
 - **Audit log** — append-only JSONL log of all user messages and bot replies; timeouts are recorded distinctly from genuine LLM replies
@@ -73,15 +74,35 @@ You don't need to add it to your PATH — you'll point LocalBot at it directly v
 
 ### 3. A GGUF model file
 
-Download a quantized GGUF model. A few good starting points:
+Download a quantized GGUF model. Recommendations are grouped by use-case and hardware tier below.
 
-| Model | Size | Notes |
-|---|---|---|
-| [Llama-3.2-3B-Instruct-Q4_K_M](https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF) | ~2 GB | Fast, CPU-friendly |
-| [Mistral-7B-Instruct-v0.3-Q4_K_M](https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.3-GGUF) | ~6 GB | Stronger reasoning |
-| [Gemma-3-1B-it-Thinking](https://huggingface.co/Andycurrent/Gemma-3-1B-it-GLM-4.7-Flash-Heretic-Uncensored-Thinking_GGUF) | ~1 GB | Ultra-light thinking model |
+#### Recommended models (≤16 GB total RAM / shared memory)
 
-Note the full path to the downloaded `.gguf` file — you'll need it in `.env`.
+These picks comfortably fit in 8–9 GB, leaving headroom for the OS and bot process. Because LocalBot hot-swaps models between slots, only one model is loaded at a time.
+
+| Slot | Model | Quant | RAM | Notes |
+|---|---|---|---|---|
+| `general` | [Qwen3.5-7B-Instruct](https://huggingface.co/Qwen/Qwen3.5-7B-Instruct-GGUF) | Q4_K_M | ~5.5 GB | Fast, reliable tool-calling JSON |
+| `coding` | [Qwen3-Coder-7B-A2B](https://huggingface.co/Qwen/Qwen3-Coder-7B-A2B-GGUF) | Q4_K_M | ~5 GB | MoE — only 2B active params per pass |
+| `reasoning` | [Qwen3.5-7B-Instruct](https://huggingface.co/Qwen/Qwen3.5-7B-Instruct-GGUF) | Q5_K_M | ~5.8 GB | Same binary as `general`; enable thinking via `/think` system-prompt prefix |
+
+> **Tip — two files instead of three:** `general` and `reasoning` can share the same GGUF file (`Qwen3.5-7B-Instruct-Q5_K_M`). Only the system prompt differs, so swapping between those two slots is instant — no model reload. Only switching to/from `coding` triggers an actual hot-swap.
+
+```toml
+# config.toml
+[models]
+general   = "qwen3.5-7b-instruct-q5_k_m.gguf"
+coding    = "qwen3-coder-7b-a2b-q4_k_m.gguf"
+reasoning = "qwen3.5-7b-instruct-q5_k_m.gguf"
+```
+
+#### Higher-RAM options (24–48 GB)
+
+| Slot | Model | Quant | RAM |
+|---|---|---|---|
+| `general` | Mistral Small 3.1 24B | Q4_K_M | ~14 GB |
+| `coding` | Qwen3-Coder-30B-A3B (MoE) | Q4_K_M | ~18 GB |
+| `reasoning` | Qwen3.5-27B Reasoning-Distilled v2 | Q4_K_M | ~18 GB |
 
 ### 4. A Discord Bot Token
 
@@ -124,6 +145,9 @@ pip install -e ".[dev]"
 
 # With optional PDF attachment support
 pip install -e ".[pdf]"
+
+# With OpenWebUI API layer
+pip install -e ".[webui]"
 ```
 
 ### 4. Configure environment variables
@@ -149,11 +173,14 @@ Open `.env` and fill in at minimum:
 | `MODEL_TEMPERATURE` | — | Default `0.3`; try `0.1` for smaller/chattier models |
 | `BOT_OWNER_ID` | — | Your Discord user ID. When set, grants you full log access across all users (see [Self-Diagnostics](#self-diagnostics)) |
 | `SANDBOX_ROOT` | — | Absolute path to the directory the LLM may read/write. Defaults to `./sandbox` |
+| `WEBUI_API_KEY` | — | Bearer token for the OpenWebUI API layer. Leave blank to disable auth (local use only) |
+| `WEBUI_HOST` | — | Host to bind the API server to. Defaults to `127.0.0.1` |
+| `WEBUI_PORT` | — | Port to bind the API server to. Defaults to `8080` |
 
 Example values on Windows:
 ```env
 LLAMA_SERVER_EXECUTABLE=C:\llama\llama-server.exe
-LLAMA_SERVER_MODEL_PATH=C:\Users\You\models\llama-3.2-3b-instruct-q4_k_m.gguf
+LLAMA_SERVER_MODEL_PATH=C:\Users\You\models\qwen3.5-7b-instruct-q5_k_m.gguf
 SANDBOX_ROOT=C:\Users\You\localbot-workspace
 ```
 
@@ -189,6 +216,73 @@ Type `y` to download and install the update, or press Enter (or wait) to continu
 
 ---
 
+## OpenWebUI Interface
+
+LocalBot can expose a browser-based chat UI via [OpenWebUI](https://github.com/open-webui/open-webui). The `localbot-webui` process serves an OpenAI-compatible API that OpenWebUI connects to, so the three model slots (`general`, `coding`, `reasoning`) appear as selectable models in the OpenWebUI model picker.
+
+### Option A — Docker Compose (recommended)
+
+The easiest way to run both services together. Docker and Docker Compose are required.
+
+```bash
+docker compose up
+```
+
+This starts:
+- **LocalBot** on its normal Discord connection
+- **LocalBot API** on `http://localhost:8080`
+- **OpenWebUI** on `http://localhost:3000`
+
+OpenWebUI is pre-configured to point at the LocalBot API — no manual connection setup needed. Open `http://localhost:3000` in your browser to start chatting.
+
+To stop:
+
+```bash
+docker compose down
+```
+
+### Option B — Standalone (no Docker)
+
+Run the API layer alongside the Discord bot in a separate terminal.
+
+**Terminal 1 — Discord bot (as normal):**
+```bash
+localbot
+```
+
+**Terminal 2 — Web API layer:**
+```bash
+# Install the webui extra if you haven't already
+pip install -e ".[webui]"
+
+localbot-webui
+# or
+python -m localbot.webui
+```
+
+The API server starts on `http://127.0.0.1:8080` by default. Override with `WEBUI_HOST` and `WEBUI_PORT` in `.env`.
+
+**Connect OpenWebUI manually:**
+
+1. Install OpenWebUI separately — see the [OpenWebUI docs](https://docs.openwebui.com/getting-started/)
+2. In OpenWebUI → **Settings → Connections → OpenAI API**
+3. Set the API URL to `http://127.0.0.1:8080/v1`
+4. Set the API key to the value of `WEBUI_API_KEY` in your `.env` (or leave blank if auth is disabled)
+5. Click **Save** — the three LocalBot models will appear in the model picker
+
+### API endpoints
+
+| Endpoint | Description |
+|---|---|
+| `GET /v1/models` | Lists `localbot-general`, `localbot-coding`, `localbot-reasoning` |
+| `POST /v1/chat/completions` | OpenAI-compatible chat endpoint; streaming supported |
+
+### User isolation
+
+Each Bearer token value is treated as a distinct user ID (`webui:<token>`), keeping OpenWebUI history completely separate from Discord DM history. If auth is disabled (`WEBUI_API_KEY` unset), users are isolated by IP address — safe for local single-user installs.
+
+---
+
 ## Project Layout
 
 ```
@@ -197,6 +291,7 @@ src/localbot/
 ├── app.py                  # Discord event loop, rate limiting, command handler
 ├── config.py               # All settings loaded from .env
 ├── agent.py                # Core request/tool loop; intent routing (_select_slot, _detect_workspace_mode, _needs_tools)
+├── webui.py                # FastAPI OpenAI-compatible API layer for OpenWebUI
 ├── adapters/
 │   ├── llamacpp_server.py      # llama-server subprocess manager + stdout/stderr log capture
 │   ├── llamacpp_client.py      # OpenAI-compatible HTTP client; model family detection (cached); think-strip
@@ -455,6 +550,7 @@ Cron expressions are validated against legal field ranges before registration �
 - `read_logs` is scoped to the requesting user's ID by default. Set `BOT_OWNER_ID` to grant a single trusted user full log visibility. The LLM cannot bypass this scoping even if prompted to.
 - Filesystem tools are confined to `SANDBOX_ROOT`. Paths are resolved server-side; absolute paths are re-rooted and `../` traversal is blocked at the OS level before any I/O occurs.
 - The auto-updater downloads only from the official `ggml-org/llama.cpp` GitHub Releases. `LLAMA_SERVER_EXTRA_ARGS` is the only value passed directly to a subprocess and must be set only by a trusted operator via `.env`.
+- The OpenWebUI API layer (`webui.py`) requires a Bearer token when `WEBUI_API_KEY` is set. Each token value is treated as a distinct user ID to maintain conversation isolation. Do not expose `WEBUI_PORT` to the public internet without a reverse proxy and TLS.
 
 ---
 
