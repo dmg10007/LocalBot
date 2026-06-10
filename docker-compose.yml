@@ -1,0 +1,64 @@
+# docker-compose.yml
+# One-command stack: LocalBot HTTP API + OpenWebUI
+#
+# Prerequisites
+# -------------
+# 1. Copy .env.example to .env and fill in LLAMA_SERVER_EXECUTABLE,
+#    LLAMA_SERVER_MODEL_PATH, and optionally BRAVE_API_KEY.
+# 2. Set WEBUI_API_KEY in .env (or unset it to disable auth for local use).
+# 3. llama-server must be accessible from *inside* the localbot container
+#    (either installed at the path given by LLAMA_SERVER_EXECUTABLE on a
+#    bind-mounted host directory, or built into the image).
+#
+# Usage
+# -----
+#   docker compose up
+#
+# Then open http://localhost:3000, go to Settings → Connections → OpenAI API:
+#   URL:  http://localbot-api:8000/v1
+#   Key:  <WEBUI_API_KEY from .env>  (or any string if auth is off)
+
+services:
+  localbot-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.webui
+    env_file: .env
+    environment:
+      WEBUI_HOST: "0.0.0.0"
+      WEBUI_PORT: "8000"
+    ports:
+      - "8000:8000"
+    volumes:
+      # Give the container access to the llama-server binary and models.
+      # Adjust these paths to match your host layout.
+      - "${LLAMA_SERVER_EXECUTABLE%/*}:/llama:ro"
+      - "${SANDBOX_ROOT:-./sandbox}:/sandbox"
+      - ./storage:/app/storage
+      - ./logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    ports:
+      - "3000:8080"
+    environment:
+      # Tell OpenWebUI not to look for a local Ollama instance.
+      OLLAMA_BASE_URL: ""
+      # Pre-configure the LocalBot API connection.
+      OPENAI_API_BASE_URL: "http://localbot-api:8000/v1"
+      OPENAI_API_KEY: "${WEBUI_API_KEY:-localbot}"
+    volumes:
+      - open-webui-data:/app/backend/data
+    depends_on:
+      localbot-api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  open-webui-data:
