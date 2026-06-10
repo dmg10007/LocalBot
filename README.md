@@ -7,14 +7,16 @@ A lightweight Discord DM bot that runs a local LLM via [llama.cpp](https://githu
 - **Conversational chat** with per-user message history (SQLite-backed)
 - **Deep web search** via Brave Search API — fetches and summarises actual page content, not just index snippets
 - **Reddit search** — searches Reddit posts and discussions via the unauthenticated JSON API
+- **Filesystem workspace** — the LLM can read, write, list, patch, and search files inside a sandboxed directory; absolute paths and directory traversal are blocked at the OS level
 - **Scheduled prompts** — users define recurring jobs via natural language; the LLM converts schedules to cron expressions and calls `schedule_job` directly; commands (`jobs list`, `jobs cancel <id>`) are also available
 - **Self-diagnostics** — the LLM can call `read_logs` to read and reason over the audit log in real time; ask *"why did my last job fail?"* or *"check the logs for errors"* conversationally
-- **Model-agnostic inference** — auto-detects model family once on startup; swap models by changing one line in `.env`
+- **Model-agnostic inference** — auto-detects model family once on startup and caches the result; swap models by changing one line in `.env`
 - **Thinking model support** — automatically strips `<think>` blocks for reasoning models (Gemma, DeepSeek, Qwen)
-- **Rate limiting** — per-user cooldown with bounded memory (stale entries are automatically evicted)
+- **Intent-based slot routing** — agent routes each request to the appropriate model slot (`general`, `coding`, `reasoning`) based on message intent
+- **Rate limiting** — per-user cooldown with bounded memory; stale entries are automatically evicted so the table never grows unboundedly
 - **Self-healing** — detects llama-server crashes and restarts automatically
-- **Audit log** — append-only JSONL log of all user messages and bot replies (timeouts are logged separately from genuine replies)
-- **llama-server log capture** — subprocess stdout is piped into the application logger so crashes (OOM, CUDA errors) surface immediately
+- **Audit log** — append-only JSONL log of all user messages and bot replies; timeouts are recorded distinctly from genuine LLM replies
+- **llama-server log capture** — subprocess stdout/stderr is piped into the application logger so crashes (OOM, CUDA errors) surface immediately
 - **Auto-updater** — on startup, detects available llama.cpp updates and prompts the terminal operator to install; supports unattended mode via `LLAMA_UPDATE_AUTO=true`
 - **Minimal footprint** — discord.py + aiohttp + APScheduler + BeautifulSoup4; no heavy ML dependencies
 
@@ -146,11 +148,13 @@ Open `.env` and fill in at minimum:
 | `LLAMA_SERVER_MODEL_FAMILY` | — | Leave blank for auto-detection (see [Swapping Models](#swapping-models)) |
 | `MODEL_TEMPERATURE` | — | Default `0.3`; try `0.1` for smaller/chattier models |
 | `BOT_OWNER_ID` | — | Your Discord user ID. When set, grants you full log access across all users (see [Self-Diagnostics](#self-diagnostics)) |
+| `SANDBOX_ROOT` | — | Absolute path to the directory the LLM may read/write. Defaults to `./sandbox` |
 
 Example values on Windows:
 ```env
 LLAMA_SERVER_EXECUTABLE=C:\llama\llama-server.exe
 LLAMA_SERVER_MODEL_PATH=C:\Users\You\models\llama-3.2-3b-instruct-q4_k_m.gguf
+SANDBOX_ROOT=C:\Users\You\localbot-workspace
 ```
 
 All other settings have sensible defaults. See [`.env.example`](.env.example) for the full reference.
@@ -159,10 +163,10 @@ All other settings have sensible defaults. See [`.env.example`](.env.example) fo
 
 ```bash
 # macOS / Linux
-mkdir -p logs storage
+mkdir -p logs storage sandbox
 
 # Windows (PowerShell)
-New-Item -ItemType Directory -Force -Path logs, storage
+New-Item -ItemType Directory -Force -Path logs, storage, sandbox
 ```
 
 ### 6. Run the bot
@@ -173,7 +177,7 @@ localbot
 python -m localbot
 ```
 
-`llama-server` is started automatically as a subprocess. You do **not** need to start it manually. Its output (including any crash messages) is captured and forwarded to the application log.
+`llama-server` is started automatically as a subprocess. You do **not** need to start it manually. Its stdout and stderr (including crash messages, OOM errors, and CUDA failures) are captured and forwarded to the application log.
 
 If a newer llama.cpp build is available you will be prompted in the terminal before the server starts:
 
@@ -192,28 +196,59 @@ src/localbot/
 ├── __main__.py             # `python -m localbot` entry point
 ├── app.py                  # Discord event loop, rate limiting, command handler
 ├── config.py               # All settings loaded from .env
-├── agent.py                # Core request/tool loop
+├── agent.py                # Core request/tool loop; intent routing (_select_slot, _detect_workspace_mode, _needs_tools)
 ├── adapters/
-│   ├── llamacpp_server.py      # llama-server subprocess manager + log capture
-│   ├── llamacpp_client.py      # OpenAI-compatible HTTP client, model detection, think-strip
+│   ├── llamacpp_server.py      # llama-server subprocess manager + stdout/stderr log capture
+│   ├── llamacpp_client.py      # OpenAI-compatible HTTP client; model family detection (cached); think-strip
 │   ├── llamacpp_updater.py     # Startup update check (GitHub Releases API)
 │   └── llamacpp_downloader.py  # Asset selection, streaming download, zip extraction
 ├── tools/
-│   ├── registry.py         # Tool schemas + dispatcher (static + scheduler)
+│   ├── registry.py         # Tool schemas + async dispatcher (timeout-guarded)
+│   ├── filesystem.py       # read/write/list/patch/search — sandboxed to SANDBOX_ROOT
 │   ├── log_reader.py       # read_logs — audit log reader for self-diagnostics
 │   ├── scheduler_tools.py  # LLM-callable schedule_job / cancel_job / list_jobs wrappers
-│   ├── search.py           # Brave Search + page fetch & summarise
+│   ├── search.py           # Brave Search + page fetch & summarise; PDF skip fix
 │   ├── reddit.py           # Reddit JSON API (no auth required)
 │   └── time_tools.py       # Current time / timezone helpers
 ├── scheduler/
-│   ├── service.py          # APScheduler wrapper + cron validation
-│   └── store.py            # SQLite job persistence + atomic limit checks
+│   ├── service.py          # APScheduler wrapper; cron validation; atomic job-limit check
+│   └── store.py            # SQLite job persistence
 ├── storage/
 │   ├── db.py               # Schema initialisation
 │   ├── history.py          # Per-user conversation history (SQLite)
 │   └── audit.py            # Append-only JSONL audit log
 └── messaging.py            # Discord 2000-char message splitting
+tests/
+├── conftest.py                          # Stubs config + heavy deps for CI
+├── test_agent_needs_tools.py
+├── test_llamacpp_family_detection.py
+├── test_messaging.py
+├── test_routing_dispatch_filesystem.py  # Routing, async dispatch, filesystem sandbox
+├── test_scheduler_validate_cron.py
+└── test_search_should_skip.py
 ```
+
+---
+
+## Filesystem Workspace
+
+When `SANDBOX_ROOT` is configured, the LLM gains access to six filesystem tools:
+
+| Tool | Description |
+|---|---|
+| `read_file` | Read a text file; large files are truncated with a notice |
+| `write_file` | Write (or overwrite) a text file; parent dirs are created automatically |
+| `list_directory` | List files and subdirectories with sizes |
+| `apply_patch` | Apply a unified diff patch to an existing file |
+| `search_in_files` | Case-insensitive grep across the workspace; supports glob filters |
+| `get_current_dir` | Return the current working path relative to `SANDBOX_ROOT` |
+
+**Security guarantees:**
+- All paths are resolved inside `SANDBOX_ROOT` before any I/O. Absolute paths are re-rooted; `../` traversal raises `PermissionError`.
+- Binary file extensions (`.png`, `.jpg`, `.zip`, `.pdf`, etc.) are blocked on both read and write.
+- Tool results are capped at `MAX_TOOL_RESULT_CHARS` (default 4000 chars) before context injection.
+
+To enable, set `SANDBOX_ROOT` in `.env` to any directory you are comfortable giving the bot read/write access to.
 
 ---
 
@@ -221,7 +256,7 @@ src/localbot/
 
 To try a different model, update `LLAMA_SERVER_MODEL_PATH` in `.env` and restart. No other changes are needed.
 
-On startup LocalBot queries `/v1/models`, reads the loaded filename, and automatically applies the correct stop tokens and think-stripping for the detected family. Detection runs only once — subsequent readiness probes reuse the cached result.
+On startup LocalBot queries `/v1/models`, reads the loaded filename, and automatically applies the correct stop tokens and think-stripping for the detected family. **Detection runs only once** — the result is cached and reused on all subsequent readiness probes, so there is no per-request overhead.
 
 | Family | Matched by filename | Stop tokens | Think-strip |
 |---|---|---|---|
@@ -265,7 +300,7 @@ When a user asks the bot to search for something, it:
 4. Passes up to `SEARCH_FETCH_CHARS` characters (default 1500) of clean text per page to the LLM
 5. The LLM **summarises the actual page content** and returns a response with source links
 
-Raw PDF file URLs (those ending in `.pdf`) are skipped automatically. Pages that time out, return errors, or are on the skip list (YouTube, Twitter/X, Instagram, TikTok, Facebook) are silently skipped and fall back to the Brave index description. Tool results are capped at 4000 characters before being injected into the context window to prevent runaway responses from exhausting model RAM.
+URLs ending in `.pdf` are skipped automatically (exact extension match — not a substring check). Pages that time out, return errors, or are on the skip list (YouTube, Twitter/X, Instagram, TikTok, Facebook) are silently skipped and fall back to the Brave index description. Tool results are capped at 4000 characters before being injected into the context window to prevent runaway responses from exhausting model RAM.
 
 ### Search tuning
 
@@ -402,22 +437,23 @@ The bot will **only confirm a job once `schedule_job` has returned successfully*
 | `timezone show` | Show your saved timezone |
 | `time now` | Show the current time in your timezone |
 
-Cron expressions are validated before registration — invalid field ranges and extra fields are rejected with a clear error message. Per-user and global job limits are enforced atomically to prevent race conditions.
+Cron expressions are validated against legal field ranges before registration — invalid or over-specified expressions are rejected with a clear error. Per-user and global job limits are enforced with a single atomic DB operation to prevent race conditions under concurrent requests.
 
 ---
 
 ## Security Notes
 
 - The bot is designed for **personal/trusted-user use**. All user messages are stored in SQLite and logged to an audit file.
-- Per-user rate limiting (`RATE_LIMIT_SECONDS`, default 5s) prevents inference spam. The rate-limit table is periodically compacted so it does not grow unboundedly.
+- Per-user rate limiting (`RATE_LIMIT_SECONDS`, default 5s) prevents inference spam. The rate-limit table is bounded — stale entries are evicted automatically so it never grows unboundedly.
 - Input length is capped at `MAX_INPUT_LENGTH` characters (default 1000) before hitting the LLM.
-- Tool results are capped at 4000 characters before context injection to prevent memory exhaustion.
-- Scheduler jobs are capped per user (`SCHEDULER_MAX_JOBS_PER_USER`, default 5) with an atomic DB check to prevent races.
+- Tool results are capped at `MAX_TOOL_RESULT_CHARS` (default 4000) before context injection to prevent memory exhaustion from runaway search responses.
+- Scheduler jobs are capped per user (`SCHEDULER_MAX_JOBS_PER_USER`, default 5) with a single atomic DB check to prevent races under concurrent requests.
 - Cron expressions supplied by the LLM are validated against legal field ranges before being passed to APScheduler.
-- Timezone strings are validated against the IANA `zoneinfo` database before being stored.
-- The audit log at `AUDIT_LOG_PATH` records all interactions for review. Timeout responses are recorded distinctly from genuine LLM replies.
+- Timezone strings are validated against the IANA `zoneinfo` database before being stored — invalid values are rejected with a clear error.
+- The audit log records all interactions for review. Timeout responses are recorded distinctly from genuine LLM replies so the audit trail is accurate.
 - Scheduler tool calls (`schedule_job`, `cancel_job`, `list_jobs`) are scoped per-request to the authenticated user — the LLM cannot create or cancel jobs for other users.
 - `read_logs` is scoped to the requesting user's ID by default. Set `BOT_OWNER_ID` to grant a single trusted user full log visibility. The LLM cannot bypass this scoping even if prompted to.
+- Filesystem tools are confined to `SANDBOX_ROOT`. Paths are resolved server-side; absolute paths are re-rooted and `../` traversal is blocked at the OS level before any I/O occurs.
 - The auto-updater downloads only from the official `ggml-org/llama.cpp` GitHub Releases. `LLAMA_SERVER_EXTRA_ARGS` is the only value passed directly to a subprocess and must be set only by a trusted operator via `.env`.
 
 ---
@@ -442,6 +478,8 @@ mypy src/
 ```bash
 pytest
 ```
+
+The test suite uses `conftest.py` to stub `localbot.config` and optional heavy dependencies (discord.py, APScheduler) before collection, so `pytest` works in a clean environment without a running bot or llama-server.
 
 ---
 
