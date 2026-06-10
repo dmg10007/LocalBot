@@ -1,8 +1,12 @@
-"""Per-user conversation history backed by SQLite."""
+"""Per-user conversation history backed by SQLite.
+
+Uses a single persistent WAL-mode connection per process rather than
+opening a new connection on every call (issue #11).
+"""
 from __future__ import annotations
 
 import sqlite3
-from contextlib import closing
+import threading
 from typing import TypedDict
 
 from localbot.config import cfg
@@ -13,15 +17,34 @@ class Message(TypedDict):
     content: str
 
 
-def _con() -> sqlite3.Connection:
-    con = sqlite3.connect(cfg.database_path)
-    con.execute("PRAGMA journal_mode=WAL")
-    return con
+# ---------------------------------------------------------------------------
+# Shared connection
+# ---------------------------------------------------------------------------
 
+_lock = threading.Lock()
+_con: sqlite3.Connection | None = None
+
+
+def _get_con() -> sqlite3.Connection:
+    """Return the module-level connection, creating it on first call."""
+    global _con
+    if _con is None:
+        _con = sqlite3.connect(
+            cfg.database_path,
+            check_same_thread=False,  # guarded by _lock for writes
+        )
+        _con.execute("PRAGMA journal_mode=WAL")
+        _con.execute("PRAGMA synchronous=NORMAL")
+    return _con
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def get_history(user_id: str) -> list[Message]:
-    # Fix #1: use closing() to guarantee the connection is released even on error.
-    with closing(_con()) as con:
+    con = _get_con()
+    with _lock:
         rows = con.execute(
             "SELECT role, content FROM history WHERE user_id = ? "
             "ORDER BY id DESC LIMIT ?",
@@ -31,10 +54,13 @@ def get_history(user_id: str) -> list[Message]:
 
 
 def append_message(user_id: str, role: str, content: str) -> None:
-    # Fix #1 & #12: use closing() for safety; drop the COUNT(*) — the
-    # DELETE … NOT IN … is a no-op when history is already within the cap,
-    # so running it unconditionally is simpler and avoids an extra round-trip.
-    with closing(_con()) as con:
+    """Insert a message and trim history to the configured cap.
+
+    The DELETE ... NOT IN ... is a no-op when the row count is already
+    within the cap, so no separate COUNT(*) round-trip is needed.
+    """
+    con = _get_con()
+    with _lock:
         with con:
             con.execute(
                 "INSERT INTO history (user_id, role, content) VALUES (?, ?, ?)",
@@ -48,6 +74,7 @@ def append_message(user_id: str, role: str, content: str) -> None:
 
 
 def clear_history(user_id: str) -> None:
-    with closing(_con()) as con:
+    con = _get_con()
+    with _lock:
         with con:
             con.execute("DELETE FROM history WHERE user_id = ?", (user_id,))
