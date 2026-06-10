@@ -131,8 +131,11 @@ class ModelRegistry:
             model_path=sc.model_path,
             port=sc.port,
         )
+        # Use cfg.llama_server_client_host (default 127.0.0.1) — NOT
+        # cfg.llama_server_host which is the bind address (0.0.0.0) and
+        # is not a routable destination.
         client = LlamaCppClient(
-            host=cfg.llama_server_host,
+            host=cfg.llama_server_client_host,
             port=sc.port,
         )
 

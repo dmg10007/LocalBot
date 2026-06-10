@@ -59,7 +59,15 @@ class Config:
     # ── Legacy single-model config (still works; used as general slot fallback) ──
     llama_server_executable: str = field(default_factory=lambda: _get("LLAMA_SERVER_EXECUTABLE", "llama-server"))
     llama_server_model_path: str = field(default_factory=lambda: _get("LLAMA_SERVER_MODEL_PATH"))
+    # Bind address passed to llama-server via --host (e.g. 0.0.0.0 to listen
+    # on all interfaces, 127.0.0.1 for loopback only).
     llama_server_host: str = field(default_factory=lambda: _get("LLAMA_SERVER_HOST", "127.0.0.1"))
+    # Address that LlamaCppClient dials when connecting to llama-server.
+    # Usually 127.0.0.1 regardless of the bind address — connecting to
+    # 0.0.0.0 is not routable and will cause health-check timeouts.
+    llama_server_client_host: str = field(
+        default_factory=lambda: _get("LLAMA_SERVER_CLIENT_HOST", "127.0.0.1")
+    )
     llama_server_port: int = field(default_factory=lambda: _get_int("LLAMA_SERVER_PORT", 8080))
     llama_server_n_gpu_layers: int = field(default_factory=lambda: _get_int("LLAMA_SERVER_N_GPU_LAYERS", 0))
     llama_server_ctx_size: int = field(default_factory=lambda: _get_int("LLAMA_SERVER_CTX_SIZE", 4096))
