@@ -2,10 +2,10 @@
 # Build arg EXTRA installs an optional extras group (e.g. "webui").
 # Leave blank for the default Discord bot image.
 #
-# The llama stage downloads the pre-built Ubuntu x64 llama-server release
-# and copies the binary + all shared libraries into the final image.
-# All libggml-cpu-*.so, libggml-base.so, libllama.so etc. are co-located
-# in /opt/llama so the dynamic linker finds them via ld.so.conf at runtime.
+# llama-server resolves backend plugins (libggml-cpu-*.so etc.) via
+# dlopen() relative to the executable directory, not the system linker.
+# We keep the full release in /opt/llama AND symlink every .so into
+# /usr/local/bin/ (next to the binary) so both resolution paths work.
 
 # ── Stage 1: download llama-server + shared libs ────────────────────────
 FROM python:3.11-slim AS llama
@@ -27,11 +27,15 @@ ARG EXTRA=""
 
 WORKDIR /app
 
-# Keep all llama release files together so relative .so paths resolve,
-# then register the directory with the dynamic linker.
+# Copy the full release directory and place the binary in PATH.
+# Then symlink every .so into the same directory as the binary so that
+# llama-server's dlopen() calls (which use paths relative to the
+# executable) can find libggml-cpu-*.so, libggml-base.so, etc.
 COPY --from=llama /opt/llama/ /opt/llama/
 RUN cp /opt/llama/llama-server /usr/local/bin/llama-server && \
     chmod +x /usr/local/bin/llama-server && \
+    find /opt/llama -maxdepth 1 -name '*.so*' \
+         -exec ln -sf {} /usr/local/bin/ \; && \
     echo "/opt/llama" > /etc/ld.so.conf.d/llama.conf && \
     ldconfig
 
