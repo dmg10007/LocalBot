@@ -1,136 +1,116 @@
-"""Load and validate configuration from environment variables."""
+"""Load and validate configuration from environment variables.
+
+Uses pydantic-settings for strict type coercion, documented defaults,
+and a single `cfg` singleton.  All callers import `cfg` directly.
+"""
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass, field
 from pathlib import Path
-from dotenv import load_dotenv
 
-load_dotenv()
+from pydantic import field_validator, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _PROJECT_ROOT = Path.cwd().resolve()
 
 
-def _get(key: str, default: str = "") -> str:
-    return os.environ.get(key, default)
-
-
-def _get_int(key: str, default: int) -> int:
-    val = os.environ.get(key)
-    return int(val) if val is not None else default
-
-
-def _get_float(key: str, default: float) -> float:
-    val = os.environ.get(key)
-    return float(val) if val is not None else default
-
-
-def _get_bool(key: str, default: bool) -> bool:
-    val = os.environ.get(key)
-    if val is None:
-        return default
-    return val.strip().lower() not in ("0", "false", "no", "off")
-
-
-def _safe_path(value: str, env_key: str) -> str:
+def _safe_path(value: str, field_name: str) -> str:
+    """Resolve *value* relative to the project root and reject escapes."""
     resolved = (_PROJECT_ROOT / value).resolve()
     try:
         resolved.relative_to(_PROJECT_ROOT)
-    except ValueError:
+    except ValueError as exc:
         raise ValueError(
-            f"{env_key}={value!r} resolves to {resolved}, which is outside "
-            f"the project root {_PROJECT_ROOT}. Use a relative path or a "
-            f"subdirectory of the project."
-        )
+            f"{field_name}={value!r} resolves to {resolved}, which is outside "
+            f"the project root {_PROJECT_ROOT}. Use a relative sub-path."
+        ) from exc
     return str(resolved)
 
 
-@dataclass
-class Config:
-    discord_bot_token: str = field(default_factory=lambda: _get("DISCORD_BOT_TOKEN"))
-
-    # ── Legacy single-model config ───────────────────────────────────────────────────
-    llama_server_executable: str = field(default_factory=lambda: _get("LLAMA_SERVER_EXECUTABLE", "llama-server"))
-    llama_server_model_path: str = field(default_factory=lambda: _get("LLAMA_SERVER_MODEL_PATH"))
-    # Bind address passed to the llama-server subprocess via --host.
-    llama_server_host: str = field(default_factory=lambda: _get("LLAMA_SERVER_HOST", "127.0.0.1"))
-    # Address LlamaCppClient dials. Usually 127.0.0.1 regardless of bind addr.
-    llama_server_client_host: str = field(
-        default_factory=lambda: _get("LLAMA_SERVER_CLIENT_HOST", "127.0.0.1")
-    )
-    llama_server_port: int = field(default_factory=lambda: _get_int("LLAMA_SERVER_PORT", 8080))
-    llama_server_n_gpu_layers: int = field(default_factory=lambda: _get_int("LLAMA_SERVER_N_GPU_LAYERS", 0))
-    llama_server_ctx_size: int = field(default_factory=lambda: _get_int("LLAMA_SERVER_CTX_SIZE", 4096))
-    llama_server_threads: int = field(default_factory=lambda: _get_int("LLAMA_SERVER_THREADS", 0))
-    llama_server_extra_args: str = field(default_factory=lambda: _get("LLAMA_SERVER_EXTRA_ARGS"))
-    llama_server_model_family: str = field(default_factory=lambda: _get("LLAMA_SERVER_MODEL_FAMILY"))
-
-    # ── Remote llama-server (webui mode) ────────────────────────────────────────────
-    # When set, webui skips ModelRegistry (subprocess management) and
-    # connects directly to a remote llama-server at this host/port.
-    # In Docker Compose this is the service name of the localbot container.
-    llama_remote_host: str = field(default_factory=lambda: _get("LLAMA_REMOTE_HOST"))
-    llama_remote_port: int = field(default_factory=lambda: _get_int("LLAMA_REMOTE_PORT", 8080))
-
-    # ── Multi-model slot config ──────────────────────────────────────────────────
-    slot_general_model: str = field(
-        default_factory=lambda: _get("SLOT_GENERAL_MODEL") or _get("LLAMA_SERVER_MODEL_PATH")
-    )
-    slot_general_port: int = field(
-        default_factory=lambda: _get_int("SLOT_GENERAL_PORT", 0) or _get_int("LLAMA_SERVER_PORT", 8080)
-    )
-    slot_coding_model: str = field(default_factory=lambda: _get("SLOT_CODING_MODEL"))
-    slot_coding_port: int = field(default_factory=lambda: _get_int("SLOT_CODING_PORT", 8081))
-    slot_reasoning_model: str = field(default_factory=lambda: _get("SLOT_REASONING_MODEL"))
-    slot_reasoning_port: int = field(default_factory=lambda: _get_int("SLOT_REASONING_PORT", 8082))
-
-    idle_unload_seconds: int = field(default_factory=lambda: _get_int("IDLE_UNLOAD_SECONDS", 120))
-
-    # ── Update checker ───────────────────────────────────────────────────────────
-    llama_update_check: bool = field(default_factory=lambda: _get_bool("LLAMA_UPDATE_CHECK", True))
-    llama_update_check_timeout_seconds: int = field(
-        default_factory=lambda: _get_int("LLAMA_UPDATE_CHECK_TIMEOUT_SECONDS", 10)
-    )
-    llama_update_auto: bool = field(default_factory=lambda: _get_bool("LLAMA_UPDATE_AUTO", False))
-    llama_update_prompt_timeout_seconds: int = field(
-        default_factory=lambda: _get_int("LLAMA_UPDATE_PROMPT_TIMEOUT_SECONDS", 30)
+class Config(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
     )
 
-    # ── Search ───────────────────────────────────────────────────────────────────
-    brave_api_key: str = field(default_factory=lambda: _get("BRAVE_API_KEY"))
-    search_result_count: int = field(default_factory=lambda: _get_int("SEARCH_RESULT_COUNT", 5))
-    search_fetch_count: int = field(default_factory=lambda: _get_int("SEARCH_FETCH_COUNT", 3))
-    search_fetch_chars: int = field(default_factory=lambda: _get_int("SEARCH_FETCH_CHARS", 1500))
-    search_fetch_timeout_seconds: int = field(default_factory=lambda: _get_int("SEARCH_FETCH_TIMEOUT_SECONDS", 8))
+    # ── Required ────────────────────────────────────────────────────────────
+    discord_bot_token: str = ""
 
-    # ── Model / inference ────────────────────────────────────────────────────────
-    model_timeout_seconds: int = field(default_factory=lambda: _get_int("MODEL_TIMEOUT_SECONDS", 120))
-    model_temperature: float = field(default_factory=lambda: _get_float("MODEL_TEMPERATURE", 0.3))
-    tool_timeout_seconds: int = field(default_factory=lambda: _get_int("TOOL_TIMEOUT_SECONDS", 30))
-    request_deadline_seconds: int = field(default_factory=lambda: _get_int("REQUEST_DEADLINE_SECONDS", 300))
+    # ── llama-server subprocess ──────────────────────────────────────────────
+    llama_server_executable: str = "llama-server"
+    llama_server_model_path: str = ""
+    llama_server_host: str = "127.0.0.1"
+    llama_server_client_host: str = "127.0.0.1"
+    llama_server_port: int = 8080
+    llama_server_n_gpu_layers: int = 0
+    llama_server_ctx_size: int = 4096
+    llama_server_threads: int = 0
+    llama_server_extra_args: str = ""
+    llama_server_model_family: str = ""
 
-    max_history_messages: int = field(default_factory=lambda: _get_int("MAX_HISTORY_MESSAGES", 12))
-    max_tool_iterations: int = field(default_factory=lambda: _get_int("MAX_TOOL_ITERATIONS", 5))
+    # ── Remote llama-server (webui / Docker Compose) ─────────────────────────
+    llama_remote_host: str = ""
+    llama_remote_port: int = 8080
 
-    # ── Storage ──────────────────────────────────────────────────────────────────
-    database_path: str = field(default_factory=lambda: _get("DATABASE_PATH", "storage/localbot.sqlite3"))
-    audit_log_path: str = field(default_factory=lambda: _get("AUDIT_LOG_PATH", "logs/audit.jsonl"))
+    # ── Multi-slot model routing ─────────────────────────────────────────────
+    slot_general_model: str = ""
+    slot_general_port: int = 0          # 0 → falls back to llama_server_port
+    slot_coding_model: str = ""
+    slot_coding_port: int = 8081
+    slot_reasoning_model: str = ""
+    slot_reasoning_port: int = 8082
 
-    # ── Scheduler ────────────────────────────────────────────────────────────────
-    scheduler_max_jobs: int = field(default_factory=lambda: _get_int("SCHEDULER_MAX_JOBS", 20))
-    scheduler_max_jobs_per_user: int = field(default_factory=lambda: _get_int("SCHEDULER_MAX_JOBS_PER_USER", 5))
+    idle_unload_seconds: int = 120
 
-    # ── Rate limiting ────────────────────────────────────────────────────────────
-    rate_limit_seconds: int = field(default_factory=lambda: _get_int("RATE_LIMIT_SECONDS", 5))
-    max_input_length: int = field(default_factory=lambda: _get_int("MAX_INPUT_LENGTH", 1000))
+    # ── Auto-updater ─────────────────────────────────────────────────────────
+    llama_update_check: bool = True
+    llama_update_check_timeout_seconds: int = 10
+    llama_update_auto: bool = False
+    llama_update_prompt_timeout_seconds: int = 30
 
-    # ── Coding assistant ─────────────────────────────────────────────────────────
-    sandbox_root: str = field(default_factory=lambda: _get("SANDBOX_ROOT"))
-    github_token: str = field(default_factory=lambda: _get("GITHUB_TOKEN"))
-    github_default_owner: str = field(default_factory=lambda: _get("GITHUB_DEFAULT_OWNER"))
+    # ── Brave Search ─────────────────────────────────────────────────────────
+    brave_api_key: str = ""
+    search_result_count: int = 5
+    search_fetch_count: int = 3
+    search_fetch_chars: int = 1500
+    search_fetch_timeout_seconds: int = 8
 
-    def __post_init__(self) -> None:
-        missing = []
+    # ── Inference knobs ──────────────────────────────────────────────────────
+    model_timeout_seconds: int = 120
+    model_temperature: float = 0.3
+    tool_timeout_seconds: int = 30
+    request_deadline_seconds: int = 300
+    max_history_messages: int = 12
+    max_tool_iterations: int = 5
+
+    # ── Storage ──────────────────────────────────────────────────────────────
+    database_path: str = "storage/localbot.sqlite3"
+    audit_log_path: str = "logs/audit.jsonl"
+
+    # ── Scheduler ────────────────────────────────────────────────────────────
+    scheduler_max_jobs: int = 20
+    scheduler_max_jobs_per_user: int = 5
+
+    # ── Rate limiting ────────────────────────────────────────────────────────
+    rate_limit_seconds: int = 5
+    max_input_length: int = 1000
+
+    # ── Sandbox / GitHub ─────────────────────────────────────────────────────
+    sandbox_root: str = ""
+    github_token: str = ""
+    github_default_owner: str = ""
+
+    # ── Cross-field resolution ────────────────────────────────────────────────
+    @model_validator(mode="after")
+    def _resolve(self) -> "Config":
+        # slot_general falls back to legacy single-model keys.
+        if not self.slot_general_model:
+            self.slot_general_model = self.llama_server_model_path
+        if self.slot_general_port == 0:
+            self.slot_general_port = self.llama_server_port
+
+        missing: list[str] = []
         if not self.discord_bot_token:
             missing.append("DISCORD_BOT_TOKEN")
         if not self.slot_general_model:
@@ -143,6 +123,21 @@ class Config:
 
         self.database_path = _safe_path(self.database_path, "DATABASE_PATH")
         self.audit_log_path = _safe_path(self.audit_log_path, "AUDIT_LOG_PATH")
+        return self
+
+    @field_validator("model_temperature")
+    @classmethod
+    def _clamp_temperature(cls, v: float) -> float:
+        if not 0.0 <= v <= 2.0:
+            raise ValueError("MODEL_TEMPERATURE must be between 0.0 and 2.0")
+        return v
+
+    @field_validator("llama_server_n_gpu_layers")
+    @classmethod
+    def _nonneg_gpu_layers(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("LLAMA_SERVER_N_GPU_LAYERS must be >= 0")
+        return v
 
 
 cfg = Config()
