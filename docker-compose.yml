@@ -1,19 +1,26 @@
-# LocalBot — full stack
-# Starts the Discord bot, the OpenWebUI API bridge, and OpenWebUI itself.
+# LocalBot — full stack (tuned for i5-10400H, 16 GB RAM, no discrete GPU)
 #
-# Prerequisites:
-#   1. Copy .env.example to .env and fill in your values.
-#   2. Place your GGUF model file(s) in a local folder and set
-#      SLOT_*_MODEL paths to match the container path (see volumes below).
+# Resource budget (leaving ~3 GB for Windows + Docker Desktop overhead):
+#   localbot          → 6 GB RAM, 3 CPU cores  (llama-server is the heavy lifter)
+#   localbot-webui    → 512 MB RAM, 1 CPU core
+#   github-mcp-server → 256 MB RAM, 0.5 CPU core
+#   openwebui         → 1 GB RAM, 1 CPU core
+#   -------------------------------------------------
+#   Total reserved    → ~7.75 GB / 5.5 cores
 #
-# Usage:
-#   docker compose up -d          # start all services
-#   docker compose logs -f        # stream logs
-#   docker compose down           # stop and remove containers
+# llama.cpp tuning (CPU-only, no GPU):
+#   - LLAMA_ARG_N_GPU_LAYERS=0       → all layers on CPU
+#   - LLAMA_ARG_THREADS=4            → use all physical cores for inference
+#   - LLAMA_ARG_THREADS_BATCH=4      → same for batch/prompt processing
+#   - LLAMA_ARG_CTX_SIZE=4096        → 4k context; raise to 8192 only if you have headroom
+#   - LLAMA_ARG_N_PARALLEL=1         → single concurrent request (no GPU = no parallelism gains)
+#   - LLAMA_ARG_BATCH_SIZE=512       → smaller batch = lower peak RAM spike during prompt eval
+#   - LLAMA_ARG_MLOCK=false          → let OS manage paging; mlock on 16 GB is risky
+#   - LLAMA_ARG_MMAP=true            → memory-map model file; faster cold start, lower RSS
 
 services:
 
-  # ── LocalBot (Discord bot + background scheduler) ────────────────────────
+  # ── LocalBot (Discord bot + llama-server subprocess) ─────────────────────
   localbot:
     build:
       context: .
@@ -22,19 +29,35 @@ services:
     restart: unless-stopped
     env_file: .env
     volumes:
-      - C:\Llama\Models:/models:ro
+      - C:\\Llama\\Models:/models:ro
       - ./storage:/app/storage
       - ./logs:/app/logs
       - ./sandbox:/app/sandbox
     environment:
-      # Use the Linux binary baked into the image — no Windows .exe needed.
       LLAMA_SERVER_EXECUTABLE: /usr/local/bin/llama-server
       LLAMA_SERVER_HOST: 0.0.0.0
       LLAMA_SERVER_CLIENT_HOST: 127.0.0.1
+      # ── llama.cpp inference tuning ────────────────────────────────
+      LLAMA_ARG_N_GPU_LAYERS: "0"
+      LLAMA_ARG_THREADS: "4"
+      LLAMA_ARG_THREADS_BATCH: "4"
+      LLAMA_ARG_CTX_SIZE: "${LLAMA_CTX_SIZE:-4096}"
+      LLAMA_ARG_BATCH_SIZE: "512"
+      LLAMA_ARG_N_PARALLEL: "1"
+      LLAMA_ARG_MLOCK: "false"
+      LLAMA_ARG_MMAP: "true"
+    deploy:
+      resources:
+        limits:
+          cpus: "3.0"
+          memory: 6G
+        reservations:
+          cpus: "2.0"
+          memory: 4G
     networks:
       - localbot-net
 
-  # ── LocalBot WebUI API bridge ────────────────────────────────────────
+  # ── LocalBot WebUI API bridge ──────────────────────────────────────
   localbot-webui:
     build:
       context: .
@@ -50,8 +73,6 @@ services:
     environment:
       WEBUI_HOST: 0.0.0.0
       WEBUI_PORT: "8080"
-      # Remote mode: forward requests to localbot's llama-server over the
-      # Docker bridge network instead of spawning a subprocess.
       LLAMA_REMOTE_HOST: localbot
       LLAMA_REMOTE_PORT: "8080"
     volumes:
@@ -59,26 +80,39 @@ services:
       - ./logs:/app/logs
     depends_on:
       - localbot
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
     networks:
       - localbot-net
 
-  # ── GitHub MCP Server ───────────────────────────────────────────────────
-  # Exposes the official GitHub MCP server over HTTP so
-  # OpenWebUI can connect to it natively via Settings → Tools → MCP.
-  # Connect OpenWebUI to: http://github-mcp-server:8181/mcp (Bearer token)
+  # ── GitHub MCP Server ──────────────────────────────────────────────
   github-mcp-server:
     image: ghcr.io/github/github-mcp-server:latest
     container_name: github-mcp-server
     restart: unless-stopped
-    command: ["http", "--port", "8181"]
+    command: ["http", "--host", "0.0.0.0", "--port", "8181"]
     ports:
       - "8181:8181"
     environment:
       GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_TOKEN}
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          cpus: "0.1"
+          memory: 128M
     networks:
       - localbot-net
 
-  # ── OpenWebUI ───────────────────────────────────────────────────────────
+  # ── OpenWebUI ─────────────────────────────────────────────────────
   openwebui:
     image: ghcr.io/open-webui/open-webui:main
     container_name: openwebui
@@ -86,45 +120,24 @@ services:
     ports:
       - "3000:8080"
     environment:
-      # --- Connection ---
       OPENAI_API_BASE_URL: http://localbot-webui:8080/v1
       OPENAI_API_KEY: ${WEBUI_API_KEY:-localbot}
-
-      # --- Auth: single-user, lock it down ---
-      ENABLE_SIGNUP: "false"
       ENABLE_OLLAMA_API: "false"
-      WEBUI_ADMIN_EMAIL: ${WEBUI_ADMIN_EMAIL}
-      WEBUI_ADMIN_PASSWORD: ${WEBUI_ADMIN_PASSWORD}
-      DEFAULT_USER_ROLE: pending
-
-      # --- Model defaults ---
-      DEFAULT_MODELS: localbot-general
-      DEFAULT_PINNED_MODELS: localbot-general
-
-      # --- Disable background LLM calls (prevent KV cache exhaustion on local model) ---
-      ENABLE_TITLE_GENERATION: "false"
-      ENABLE_FOLLOW_UP_GENERATION: "false"
-      ENABLE_TAGS_GENERATION: "false"
-
-      # --- Performance ---
-      AIOHTTP_CLIENT_TIMEOUT: "300"
-      AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST: "30"
-      CHAT_RESPONSE_STREAM_DELTA_CHUNK_SIZE: "3"
-      ENABLE_REALTIME_CHAT_SAVE: "false"
-
-      # --- Disable unused features ---
-      BYPASS_MODEL_ACCESS_CONTROL: "true"
-
-      # --- Branding ---
-      WEBUI_NAME: LocalBot
-
-      # --- Config management: docker-compose.yml is source of truth ---
-      ENABLE_PERSISTENT_CONFIG: "false"
+      # Reduce OpenWebUI background worker threads — it defaults to 8
+      UVICORN_WORKERS: "1"
     volumes:
       - openwebui-data:/app/backend/data
     depends_on:
       - localbot-webui
       - github-mcp-server
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 512M
     networks:
       - localbot-net
 
