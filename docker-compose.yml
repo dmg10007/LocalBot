@@ -63,13 +63,14 @@ services:
       - localbot-net
 
   # ── GitHub MCP Server ───────────────────────────────────────────────────
-  # Exposes the official GitHub MCP server over HTTP (SSE transport) so
+  # Exposes the official GitHub MCP server over HTTP so
   # OpenWebUI can connect to it natively via Settings → Tools → MCP.
+  # Connect OpenWebUI to: http://github-mcp-server:8181/mcp (Bearer token)
   github-mcp-server:
     image: ghcr.io/github/github-mcp-server:latest
     container_name: github-mcp-server
     restart: unless-stopped
-    command: ["--transport", "sse", "--host", "0.0.0.0", "--port", "8181"]
+    command: ["http", "--port", "8181"]
     ports:
       - "8181:8181"
     environment:
@@ -85,9 +86,37 @@ services:
     ports:
       - "3000:8080"
     environment:
+      # --- Connection ---
       OPENAI_API_BASE_URL: http://localbot-webui:8080/v1
       OPENAI_API_KEY: ${WEBUI_API_KEY:-localbot}
+
+      # --- Auth: single-user, lock it down ---
+      ENABLE_SIGNUP: "false"
       ENABLE_OLLAMA_API: "false"
+      WEBUI_ADMIN_EMAIL: ${WEBUI_ADMIN_EMAIL}
+      WEBUI_ADMIN_PASSWORD: ${WEBUI_ADMIN_PASSWORD}
+      DEFAULT_USER_ROLE: pending
+
+      # --- Model defaults ---
+      DEFAULT_MODELS: localbot-general
+      DEFAULT_PINNED_MODELS: localbot-general
+      ENABLE_TITLE_GENERATION: "false"
+      ENABLE_FOLLOW_UP_GENERATION: "false"
+
+      # --- Performance ---
+      AIOHTTP_CLIENT_TIMEOUT: "300"
+      AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST: "30"
+      CHAT_RESPONSE_STREAM_DELTA_CHUNK_SIZE: "3"
+      ENABLE_REALTIME_CHAT_SAVE: "false"
+
+      # --- Disable unused features ---
+      BYPASS_MODEL_ACCESS_CONTROL: "true"
+
+      # --- Branding ---
+      WEBUI_NAME: LocalBot
+
+      # --- Config management: docker-compose.yml is source of truth ---
+      ENABLE_PERSISTENT_CONFIG: "false"
     volumes:
       - openwebui-data:/app/backend/data
     depends_on:
