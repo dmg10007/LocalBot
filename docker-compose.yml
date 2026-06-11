@@ -34,7 +34,7 @@ services:
     networks:
       - localbot-net
 
-  # ── LocalBot WebUI API bridge ─────────────────────────────────────────────
+  # ── LocalBot WebUI API bridge ────────────────────────────────────────
   localbot-webui:
     build:
       context: .
@@ -62,7 +62,22 @@ services:
     networks:
       - localbot-net
 
-  # ── OpenWebUI ─────────────────────────────────────────────────────────────
+  # ── GitHub MCP Server ───────────────────────────────────────────────────
+  # Exposes the official GitHub MCP server over HTTP (SSE transport) so
+  # OpenWebUI can connect to it natively via Settings → Tools → MCP.
+  github-mcp-server:
+    image: ghcr.io/github/github-mcp-server:latest
+    container_name: github-mcp-server
+    restart: unless-stopped
+    command: ["--transport", "sse", "--host", "0.0.0.0", "--port", "8181"]
+    ports:
+      - "8181:8181"
+    environment:
+      GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_TOKEN}
+    networks:
+      - localbot-net
+
+  # ── OpenWebUI ───────────────────────────────────────────────────────────
   openwebui:
     image: ghcr.io/open-webui/open-webui:main
     container_name: openwebui
@@ -77,6 +92,7 @@ services:
       - openwebui-data:/app/backend/data
     depends_on:
       - localbot-webui
+      - github-mcp-server
     networks:
       - localbot-net
 
