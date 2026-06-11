@@ -1,4 +1,7 @@
-"""SQLite schema initialisation."""
+"""SQLite schema initialisation.
+
+Call init_db() once at process startup before any storage reads/writes.
+"""
 from __future__ import annotations
 
 import os
@@ -9,12 +12,15 @@ from localbot.config import cfg
 
 
 def init_db() -> None:
-    """Create tables, indexes, and required directories if they don't exist."""
+    """Create all tables, indexes, and required directories.
+
+    Idempotent: safe to call multiple times (all CREATE statements use
+    IF NOT EXISTS).  The ALTER TABLE migration is caught and ignored when
+    the column already exists.
+    """
     os.makedirs(os.path.dirname(cfg.database_path) or "storage", exist_ok=True)
     os.makedirs(os.path.dirname(cfg.audit_log_path) or "logs", exist_ok=True)
 
-    # Fix #3: use contextlib.closing so con.close() is always called, even
-    # when executescript or the ALTER TABLE migration raises an exception.
     with closing(sqlite3.connect(cfg.database_path)) as con:
         with con:
             con.executescript("""
@@ -27,12 +33,8 @@ def init_db() -> None:
                     content   TEXT    NOT NULL,
                     ts        REAL    NOT NULL DEFAULT (unixepoch('now'))
                 );
-
-                -- Primary index for per-user history lookups ordered by insertion.
                 CREATE INDEX IF NOT EXISTS idx_history_user_id
                     ON history(user_id, id DESC);
-
-                -- Keep the ts-based index for any range queries on timestamps.
                 CREATE INDEX IF NOT EXISTS idx_history_user_ts
                     ON history(user_id, ts DESC);
 
@@ -51,15 +53,13 @@ def init_db() -> None:
                 );
             """)
 
-        # Non-destructive migration: add timezone column to existing databases
-        # that were created before this column existed.  ALTER TABLE ADD COLUMN
-        # is a no-op if the column is already present (caught below).
-        # Note: this runs outside the `with con:` transaction block because
-        # DDL inside a transaction can behave unexpectedly in some SQLite versions.
+        # Non-destructive migration for databases created before the
+        # timezone column was added.
         try:
             con.execute(
-                "ALTER TABLE scheduled_jobs ADD COLUMN timezone TEXT NOT NULL DEFAULT 'UTC'"
+                "ALTER TABLE scheduled_jobs "
+                "ADD COLUMN timezone TEXT NOT NULL DEFAULT 'UTC'"
             )
             con.commit()
         except sqlite3.OperationalError:
-            pass  # column already exists
+            pass
