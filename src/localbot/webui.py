@@ -37,7 +37,26 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, List, Optional, Union
 
+from pydantic import BaseModel
+
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible request models (module-level so FastAPI can introspect)
+# ---------------------------------------------------------------------------
+
+class ChatMessage(BaseModel):
+    role: str
+    content: Union[str, List[Any]] = ""
+
+
+class ChatCompletionRequest(BaseModel):
+    model: Optional[str] = None
+    messages: List[ChatMessage] = []
+    stream: bool = False
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
 
 
 def _require_fastapi() -> None:
@@ -59,7 +78,6 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import StreamingResponse
     from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-    from pydantic import BaseModel
 
     from localbot.adapters.llamacpp_client import LlamaCppClient
     from localbot.adapters.model_registry import ModelRegistry
@@ -71,20 +89,6 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
     API_KEY: str | None = os.environ.get("WEBUI_API_KEY") or None
     USER_PREFIX: str = os.environ.get("WEBUI_USER_PREFIX", "webui:")
 
-    # ------------------------------------------------------------------
-    # Request / response models
-    # ------------------------------------------------------------------
-    class ChatMessage(BaseModel):
-        role: str
-        content: Union[str, List[Any]] = ""
-
-    class ChatCompletionRequest(BaseModel):
-        model: Optional[str] = None
-        messages: List[ChatMessage] = []
-        stream: bool = False
-        temperature: Optional[float] = None
-        max_tokens: Optional[int] = None
-
     @asynccontextmanager
     async def lifespan(app: fastapi.FastAPI) -> AsyncIterator[None]:
         # ---- startup ----
@@ -94,7 +98,7 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
         app.state.ready = False
 
         if cfg.llama_remote_host:
-            # ── Remote mode ────────────────────────────────────────────────────────────────
+            # ── Remote mode ──────────────────────────────────────────────────────────
             log.info(
                 "Remote llama-server mode: %s:%d",
                 cfg.llama_remote_host,
@@ -140,7 +144,7 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
             asyncio.create_task(_warm_remote())
 
         else:
-            # ── Local subprocess mode ────────────────────────────────────────────
+            # ── Local subprocess mode ─────────────────────────────────────────
             registry = ModelRegistry()
             _agent = Agent(registry, scheduler=scheduler)
             app.state.registry = registry
