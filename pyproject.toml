@@ -4,19 +4,21 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "localbot"
-version = "0.1.0"
-description = "Lightweight local LLM Discord bot powered by llama.cpp"
+version = "0.2.0"
+description = "Privacy-first self-hosted AI assistant powered by llama.cpp"
 requires-python = ">=3.11"
 dependencies = [
     "discord.py>=2.4",
     "aiohttp>=3.9",
     "python-dotenv>=1.0",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
     "apscheduler>=3.10",
     "beautifulsoup4>=4.12",
+    "lxml>=5.0",  # faster HTML parser for BeautifulSoup
 ]
 
 [project.optional-dependencies]
-pdf = ["pypdf>=4.0"]
 webui = [
     "fastapi>=0.111",
     "uvicorn[standard]>=0.29",
@@ -26,6 +28,7 @@ dev = [
     "mypy>=1.10",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "pydantic-settings>=2.0",
 ]
 
 [project.scripts]
@@ -40,8 +43,11 @@ line-length = 100
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "ASYNC"]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "SIM", "RUF"]
 ignore = ["E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
 
 [tool.mypy]
 python_version = "3.11"
