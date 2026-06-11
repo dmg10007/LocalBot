@@ -35,7 +35,7 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from typing import Any, AsyncIterator, List, Optional, Union
 
 log = logging.getLogger(__name__)
 
@@ -55,10 +55,11 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
     _require_fastapi()
 
     import fastapi
-    from fastapi import Depends, HTTPException, Request, status
+    from fastapi import Depends, HTTPException, status
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import StreamingResponse
     from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+    from pydantic import BaseModel
 
     from localbot.adapters.llamacpp_client import LlamaCppClient
     from localbot.adapters.model_registry import ModelRegistry
@@ -70,6 +71,20 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
     API_KEY: str | None = os.environ.get("WEBUI_API_KEY") or None
     USER_PREFIX: str = os.environ.get("WEBUI_USER_PREFIX", "webui:")
 
+    # ------------------------------------------------------------------
+    # Request / response models
+    # ------------------------------------------------------------------
+    class ChatMessage(BaseModel):
+        role: str
+        content: Union[str, List[Any]] = ""
+
+    class ChatCompletionRequest(BaseModel):
+        model: Optional[str] = None
+        messages: List[ChatMessage] = []
+        stream: bool = False
+        temperature: Optional[float] = None
+        max_tokens: Optional[int] = None
+
     @asynccontextmanager
     async def lifespan(app: fastapi.FastAPI) -> AsyncIterator[None]:
         # ---- startup ----
@@ -79,7 +94,7 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
         app.state.ready = False
 
         if cfg.llama_remote_host:
-            # ── Remote mode ──────────────────────────────────────────────────
+            # ── Remote mode ────────────────────────────────────────────────────────────────
             log.info(
                 "Remote llama-server mode: %s:%d",
                 cfg.llama_remote_host,
@@ -125,7 +140,7 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
             asyncio.create_task(_warm_remote())
 
         else:
-            # ── Local subprocess mode ────────────────────────────────────────
+            # ── Local subprocess mode ────────────────────────────────────────────
             registry = ModelRegistry()
             _agent = Agent(registry, scheduler=scheduler)
             app.state.registry = registry
@@ -223,36 +238,27 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
     # ------------------------------------------------------------------
     @app.post("/v1/chat/completions")
     async def chat_completions(
-        request: Request,
+        body: ChatCompletionRequest,
         user_id: str = Depends(_get_user_id),
     ) -> fastapi.Response:
-        """OpenAI-compatible chat completions endpoint.
-
-        `request` is FastAPI's special `Request` type — it must be the
-        first positional parameter so FastAPI injects it directly rather
-        than trying to parse it from the query string or body.
-        """
-        if not getattr(request.app.state, "ready", False):
+        """OpenAI-compatible chat completions endpoint."""
+        if not getattr(app.state, "ready", False):
             raise HTTPException(
                 status_code=503,
                 detail="Model is still loading, please retry in a moment.",
             )
 
-        body = await request.json()
-        messages: list[dict] = body.get("messages", [])
-        stream: bool = body.get("stream", False)
-
         user_text = ""
-        for m in reversed(messages):
-            if m.get("role") == "user":
-                content = m.get("content", "")
+        for m in reversed(body.messages):
+            if m.role == "user":
+                content = m.content
                 user_text = content if isinstance(content, str) else ""
                 break
 
         if not user_text:
             raise HTTPException(status_code=400, detail="No user message found.")
 
-        _agent: Agent = request.app.state.agent
+        _agent: Agent = app.state.agent
         loop = asyncio.get_event_loop()
         reply_future: asyncio.Future[str] = loop.create_future()
 
@@ -266,11 +272,11 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
         asyncio.create_task(_run())
         reply = await reply_future
 
-        model_id = "localbot-general"
+        model_id = body.model or "localbot-general"
         created = int(time.time())
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
-        if stream:
+        if body.stream:
             words = reply.split(" ")
 
             async def _sse_chunks() -> AsyncIterator[bytes]:
