@@ -17,6 +17,7 @@ Any other platform returns ``ok=False`` with an explanatory message.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import platform
 import sys
@@ -120,8 +121,20 @@ async def download_and_install(
             tag = data.get("tag_name", "?")
             log.info("Downloading %s from %s", tag, asset_url)
 
+            # GitHub Releases expose a per-asset SHA-256 in the `digest` field
+            # (format: "sha256:<hex>"). Capture the expected digest so we can
+            # verify the bytes we actually downloaded before extracting them.
+            expected_digest: str | None = None
+            for a in data.get("assets", []):
+                if a.get("browser_download_url") == asset_url:
+                    d = a.get("digest") or ""
+                    if d.startswith("sha256:"):
+                        expected_digest = d.split(":", 1)[1].lower()
+                    break
+
             # ── Step 2: stream the zip ─────────────────────────────────────
             buf = BytesIO()
+            hasher = hashlib.sha256()
             async with session.get(
                 asset_url,
                 timeout=aiohttp.ClientTimeout(total=timeout_seconds),
@@ -132,12 +145,28 @@ async def download_and_install(
                 received = 0
                 async for chunk in dl.content.iter_chunked(65536):
                     buf.write(chunk)
+                    hasher.update(chunk)
                     received += len(chunk)
                     if total:
                         pct = received * 100 // total
                         # Overwrite the same terminal line for a simple progress bar.
                         print(f"\r  Downloading... {pct:3d}%  ({received // 1024 // 1024} MB / {total // 1024 // 1024} MB)", end="", flush=True)
             print()  # newline after progress bar
+
+            actual_digest = hasher.hexdigest()
+            if expected_digest is not None and actual_digest != expected_digest:
+                return DownloadResult(
+                    ok=False,
+                    message=(
+                        f"Checksum mismatch for {tag}: expected sha256 "
+                        f"{expected_digest}, got {actual_digest}. Aborting install."
+                    ),
+                )
+            if expected_digest is None:
+                log.warning(
+                    "GitHub did not provide a SHA-256 digest for %s; "
+                    "proceeding without checksum verification.", tag,
+                )
 
     except asyncio.TimeoutError:
         return DownloadResult(ok=False, message="Download timed out")

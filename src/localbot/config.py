@@ -100,6 +100,9 @@ class Config(BaseSettings):
     sandbox_root: str = ""
     github_token: str = ""
     github_default_owner: str = ""
+    # Comma-separated allowlist of "owner" or "owner/repo" the LLM may touch.
+    # Empty → fall back to github_default_owner (if set) → deny all writes.
+    github_allowed_repos: str = ""
 
     # ── Cross-field resolution ────────────────────────────────────────────────
     @model_validator(mode="after")

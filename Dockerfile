@@ -55,7 +55,12 @@ RUN if [ -n "$EXTRA" ]; then \
       pip install --no-cache-dir -e .; \
     fi
 
-# Create directories that are expected at runtime.
-RUN mkdir -p storage logs sandbox
+# Create directories that are expected at runtime, then drop privileges.
+RUN mkdir -p storage logs sandbox \
+    && groupadd --system localbot \
+    && useradd --system --gid localbot --home-dir /app --no-create-home localbot \
+    && chown -R localbot:localbot /app
+
+USER localbot
 
 CMD ["python", "-m", "localbot"]
