@@ -96,7 +96,8 @@ services:
     image: ghcr.io/github/github-mcp-server:latest
     container_name: github-mcp-server
     restart: unless-stopped
-    command: ["http", "--host", "0.0.0.0", "--port", "8181"]
+    # --host is not supported; the server binds to 0.0.0.0 by default
+    command: ["http", "--port", "8181"]
     ports:
       - "8181:8181"
     environment:
