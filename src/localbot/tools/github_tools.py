@@ -47,6 +47,30 @@ def _no_token_error() -> str:
     )
 
 
+def _allowlist() -> set[str]:
+    raw = cfg.github_allowed_repos.strip()
+    if raw:
+        return {item.strip().lower() for item in raw.split(",") if item.strip()}
+    if cfg.github_default_owner:
+        return {cfg.github_default_owner.strip().lower()}
+    return set()
+
+
+def _repo_denied(owner: str, repo: str) -> str | None:
+    """Return an error string if owner/repo is not allowlisted, else None."""
+    allow = _allowlist()
+    if not allow:
+        return (
+            "GitHub access is not authorized: set GITHUB_ALLOWED_REPOS or "
+            "GITHUB_DEFAULT_OWNER in .env to permit specific owners/repos."
+        )
+    key_owner = owner.strip().lower()
+    key_full = f"{key_owner}/{repo.strip().lower()}"
+    if key_owner in allow or key_full in allow:
+        return None
+    return f"ERROR: '{owner}/{repo}' is not in the GitHub allowlist."
+
+
 # ---------------------------------------------------------------------------
 # Tool functions
 # ---------------------------------------------------------------------------
@@ -60,6 +84,8 @@ async def github_read_file(
     """Return the text content of a file in a GitHub repository."""
     if not cfg.github_token:
         return _no_token_error()
+    if (denied := _repo_denied(owner, repo)) is not None:
+        return denied
     url = f"{_API}/repos/{owner}/{repo}/contents/{path.lstrip('/')}"
     params = {"ref": ref}
     async with aiohttp.ClientSession(headers=_headers()) as session:
@@ -91,6 +117,8 @@ async def github_list_directory(
     """Return an annotated listing of a directory in a GitHub repository."""
     if not cfg.github_token:
         return _no_token_error()
+    if (denied := _repo_denied(owner, repo)) is not None:
+        return denied
     url = f"{_API}/repos/{owner}/{repo}/contents/{path.lstrip('/')}"
     params = {"ref": ref}
     async with aiohttp.ClientSession(headers=_headers()) as session:
@@ -121,6 +149,8 @@ async def github_create_branch(
     """Create a new branch in a GitHub repository."""
     if not cfg.github_token:
         return _no_token_error()
+    if (denied := _repo_denied(owner, repo)) is not None:
+        return denied
     # Resolve from_branch to its SHA.
     async with aiohttp.ClientSession(headers=_headers()) as session:
         ref_url = f"{_API}/repos/{owner}/{repo}/git/ref/heads/{from_branch}"
@@ -156,6 +186,8 @@ async def github_commit_files(
     """
     if not cfg.github_token:
         return _no_token_error()
+    if (denied := _repo_denied(owner, repo)) is not None:
+        return denied
     if not files:
         return "ERROR: No files provided to commit."
 
@@ -205,6 +237,8 @@ async def github_create_pull_request(
     """Open a pull request on GitHub and return its URL."""
     if not cfg.github_token:
         return _no_token_error()
+    if (denied := _repo_denied(owner, repo)) is not None:
+        return denied
     url = f"{_API}/repos/{owner}/{repo}/pulls"
     payload = {"title": title, "head": head, "base": base, "body": body}
     async with aiohttp.ClientSession(headers=_headers()) as session:
@@ -235,6 +269,8 @@ async def github_list_pull_requests(
     """
     if not cfg.github_token:
         return _no_token_error()
+    if (denied := _repo_denied(owner, repo)) is not None:
+        return denied
     url = f"{_API}/repos/{owner}/{repo}/pulls"
     params = {"state": state, "per_page": 30}
     async with aiohttp.ClientSession(headers=_headers()) as session:

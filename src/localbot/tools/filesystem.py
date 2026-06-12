@@ -55,15 +55,28 @@ def _safe_resolve(user_path: str) -> Path:
     Raises ValueError if the extension is binary.
     """
     root = _sandbox()
+    real_root = Path(os.path.realpath(root))
     # Treat absolute paths as relative to the sandbox root.
     stripped = user_path.lstrip("/\\") if os.path.isabs(user_path) else user_path
     resolved = (root / stripped).resolve()
+
+    # Containment check against the canonical (symlink-followed) root.
     try:
         resolved.relative_to(root)
     except ValueError:
         raise PermissionError(
             f"Path '{user_path}' escapes the sandbox root '{root}'. "
             "Only paths inside SANDBOX_ROOT are allowed."
+        )
+
+    # Defense in depth: re-check the fully symlink-resolved target. This
+    # catches a symlink *inside* the sandbox whose target points outside it,
+    # which the .resolve() above would have followed.
+    real_target = Path(os.path.realpath(resolved))
+    if real_target != real_root and real_root not in real_target.parents:
+        raise PermissionError(
+            f"Path '{user_path}' resolves through a symlink to {real_target}, "
+            f"outside the sandbox root '{real_root}'."
         )
     return resolved
 

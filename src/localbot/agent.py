@@ -59,7 +59,7 @@ class Agent:
 
     async def handle(self, user_id: str, user_message: str) -> str:
         """Entry point for all chat requests.  Returns the assistant reply."""
-        history = get_history(user_id)
+        history = await asyncio.to_thread(get_history, user_id)
         log_event("user_message", user_id=user_id, content=user_message)
 
         sched_tools = (
@@ -101,8 +101,8 @@ class Agent:
 
         log_event("assistant_reply", user_id=user_id, content=reply)
         if reply and reply != _TIMEOUT_REPLY:
-            append_message(user_id, "user", user_message)
-            append_message(user_id, "assistant", reply)
+            await asyncio.to_thread(append_message, user_id, "user", user_message)
+            await asyncio.to_thread(append_message, user_id, "assistant", reply)
 
         return reply
 

@@ -121,7 +121,7 @@ services:
       - "3000:8080"
     environment:
       OPENAI_API_BASE_URL: http://localbot-webui:8080/v1
-      OPENAI_API_KEY: ${WEBUI_API_KEY:-localbot}
+      OPENAI_API_KEY: ${WEBUI_API_KEY:?WEBUI_API_KEY must be set in .env}
       ENABLE_OLLAMA_API: "false"
       # Reduce OpenWebUI background worker threads — it defaults to 8
       UVICORN_WORKERS: "1"

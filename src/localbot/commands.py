@@ -44,7 +44,7 @@ async def _cmd_jobs_cancel(
     m = re.match(r"^jobs cancel ([a-zA-Z0-9_-]+)$", text, re.IGNORECASE)
     if not m:
         return False
-    cancelled = bot.scheduler.cancel_job(m.group(1))
+    cancelled = bot.scheduler.cancel_job(m.group(1), user_id=user_id)
     await message.channel.send(
         f"Job `{m.group(1)}` cancelled." if cancelled else "Job not found."
     )

@@ -27,6 +27,8 @@ LLAMA_REMOTE_PORT   Port of the remote llama-server (default: 8080).
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -98,6 +100,17 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
     API_KEY: str | None = os.environ.get("WEBUI_API_KEY") or None
     USER_PREFIX: str = os.environ.get("WEBUI_USER_PREFIX", "webui:")
     _rate_last: dict[str, float] = {}
+
+    # Fail closed: a network-exposed LLM proxy must not run unauthenticated.
+    # Set WEBUI_ALLOW_NO_AUTH=1 only for a trusted, loopback-only deployment.
+    _bind_host = os.environ.get("WEBUI_HOST", "0.0.0.0")
+    _loopback = _bind_host in ("127.0.0.1", "::1", "localhost")
+    if API_KEY is None and not _loopback and os.environ.get("WEBUI_ALLOW_NO_AUTH") != "1":
+        raise SystemExit(
+            "WEBUI_API_KEY is required when binding a non-loopback host "
+            f"({_bind_host!r}). Set WEBUI_API_KEY, bind WEBUI_HOST=127.0.0.1, "
+            "or set WEBUI_ALLOW_NO_AUTH=1 to explicitly opt out."
+        )
 
     async def _null_send(user_id: str, prompt: str) -> None:
         log.warning(
@@ -181,13 +194,16 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
     ) -> str:
         if API_KEY is None:
             return f"{USER_PREFIX}guest"
-        if creds is None or creds.credentials != API_KEY:
+        if creds is None or not hmac.compare_digest(creds.credentials, API_KEY):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or missing Bearer token.",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-        return f"{USER_PREFIX}{creds.credentials}"
+        # Never use the raw token as an identity key — it leaks into the audit
+        # log and SQLite history. Derive a stable, non-reversible id instead.
+        token_id = hashlib.sha256(creds.credentials.encode()).hexdigest()[:16]
+        return f"{USER_PREFIX}{token_id}"
 
     def _check_ready(app_state: Any) -> None:
         event: asyncio.Event = app_state.ready_event

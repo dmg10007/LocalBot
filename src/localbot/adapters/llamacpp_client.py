@@ -64,6 +64,27 @@ _THINKING_FAMILIES = {ModelFamily.GEMMA, ModelFamily.DEEPSEEK, ModelFamily.QWEN}
 
 _THINK_RE = re.compile(r"(?:<think>)?.*?</think>", re.DOTALL | re.IGNORECASE)
 
+# Default completion budget when context is plentiful.
+_MAX_COMPLETION_TOKENS = 2048
+# Reserve headroom for tool schemas, role framing, and estimator error.
+_CTX_SAFETY_MARGIN = 256
+
+
+def _estimate_tokens(messages: list[dict[str, Any]]) -> int:
+    """Rough token count: ~4 chars/token. Cheap and dependency-free.
+
+    Intentionally conservative — overestimating shrinks max_tokens, which is
+    the safe direction (avoids context overflow at the cost of a shorter reply).
+    """
+    total_chars = 0
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, str):
+            total_chars += len(content)
+        for tc in m.get("tool_calls") or []:
+            total_chars += len(str(tc.get("function", {}).get("arguments", "")))
+    return total_chars // 4
+
 
 def _detect_family_from_name(model_name: str) -> ModelFamily:
     for pattern, family in _FAMILY_PATTERNS:
@@ -161,12 +182,22 @@ class LlamaCppClient:
         Raises RuntimeError on non-2xx HTTP responses so callers receive a
         clear error instead of an aiohttp.ClientResponseError with raw bytes.
         """
+        prompt_tokens = _estimate_tokens(messages)
+        budget = cfg.llama_server_ctx_size - prompt_tokens - _CTX_SAFETY_MARGIN
+        max_tokens = max(256, min(_MAX_COMPLETION_TOKENS, budget))
+        if budget < 256:
+            log.warning(
+                "Estimated prompt (%d tok) is near ctx_size (%d) — completion "
+                "clamped to %d tokens; consider lowering MAX_HISTORY_MESSAGES "
+                "or tool-result truncation.",
+                prompt_tokens, cfg.llama_server_ctx_size, max_tokens,
+            )
         payload: dict[str, Any] = {
             "messages": messages,
             "stream": False,
             "temperature": cfg.model_temperature,
             "top_p": 0.9,
-            "max_tokens": 2048,
+            "max_tokens": max_tokens,
         }
         if tools:
             payload["tools"] = tools
