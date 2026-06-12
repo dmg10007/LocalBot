@@ -59,13 +59,22 @@ def save_job(job: Job) -> None:
             )
 
 
-def delete_job(job_id: str) -> bool:
+def delete_job(job_id: str, user_id: str | None = None) -> bool:
+    """Delete a job. When *user_id* is given, only delete a job owned by
+    that user (prevents cross-user cancellation). When None, delete by id
+    alone (used by trusted internal callers only)."""
     con = _get_con()
     with _lock:
         with con:
-            cur = con.execute(
-                "DELETE FROM scheduled_jobs WHERE job_id = ?", (job_id,)
-            )
+            if user_id is None:
+                cur = con.execute(
+                    "DELETE FROM scheduled_jobs WHERE job_id = ?", (job_id,)
+                )
+            else:
+                cur = con.execute(
+                    "DELETE FROM scheduled_jobs WHERE job_id = ? AND user_id = ?",
+                    (job_id, user_id),
+                )
         return cur.rowcount > 0
 
 

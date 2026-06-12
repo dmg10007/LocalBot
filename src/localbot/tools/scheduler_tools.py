@@ -121,7 +121,7 @@ class SchedulerTools:
             return f"Unexpected error scheduling job: {exc}"
 
     async def cancel_job(self, job_id: str) -> str:
-        cancelled = self._service.cancel_job(job_id)
+        cancelled = self._service.cancel_job(job_id, user_id=self._user_id)
         if cancelled:
             log.info("Cancelled job %s for user %s", job_id, self._user_id)
             return f"Job `{job_id}` has been cancelled."

@@ -188,12 +188,16 @@ class SchedulerService:
         )
         return job
 
-    def cancel_job(self, job_id: str) -> bool:
-        try:
-            self._scheduler.remove_job(job_id)
-        except JobLookupError:
-            pass  # job already removed or was never registered in this session
-        return delete_job(job_id)
+    def cancel_job(self, job_id: str, user_id: str | None = None) -> bool:
+        # Enforce ownership first: only remove the live APScheduler job if the
+        # DB row actually belonged to this user (or caller is trusted).
+        deleted = delete_job(job_id, user_id=user_id)
+        if deleted:
+            try:
+                self._scheduler.remove_job(job_id)
+            except JobLookupError:
+                pass  # already gone from the live scheduler
+        return deleted
 
     def list_user_jobs(self, user_id: str) -> list[Job]:
         return list_jobs(user_id)
