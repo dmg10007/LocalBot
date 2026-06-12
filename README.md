@@ -29,33 +29,41 @@ The Python layer is intentionally thin: it never loads the model itself. All inf
 
 ### 1. Python 3.11+
 
-```bash
+```powershell
 python --version   # must be 3.11 or higher
 ```
 
 Download from [python.org](https://www.python.org/downloads/) if needed.
 
-### 2. llama-server (llama.cpp)
+### 2. Docker Desktop
 
-LocalBot delegates all inference to `llama-server`. Download a pre-built binary from the [llama.cpp releases page](https://github.com/ggerganov/llama.cpp/releases/latest).
+The recommended way to run LocalBot is via Docker Compose. Download and install [Docker Desktop for Windows](https://www.docker.com/products/docker-desktop/).
+
+Verify after installation:
+
+```powershell
+docker --version
+docker compose version
+```
+
+### 3. llama-server (llama.cpp) *(local/non-Docker mode only)*
+
+If you're running **without Docker**, download a pre-built `llama-server` binary from the [llama.cpp releases page](https://github.com/ggerganov/llama.cpp/releases/latest).
 
 | Platform | File to download |
 |---|---|
 | Windows, CPU only | `llama-bXXXX-bin-win-cpu-x64.zip` |
 | Windows, NVIDIA GPU | `llama-bXXXX-bin-win-cuda-cu12.x-x64.zip` |
-| macOS (Apple Silicon) | `llama-bXXXX-bin-macos-arm64.zip` |
-| macOS (Intel) | `llama-bXXXX-bin-macos-x64.zip` |
-| Linux, CPU only | `llama-bXXXX-bin-ubuntu-x64.zip` |
 
-Extract to a permanent location (e.g. `~/llama/` or `C:\llama\`) and verify:
+Extract to a permanent location (e.g. `C:\llama\`) and verify:
 
-```bash
-~/llama/llama-server --version
+```powershell
+C:\llama\llama-server.exe --version
 ```
 
-You don't need to add it to `PATH` — you'll point LocalBot at it directly via `LLAMA_SERVER_EXECUTABLE` in `.env`.
+You don't need to add it to `PATH` — point LocalBot at it directly via `LLAMA_SERVER_EXECUTABLE` in `.env`.
 
-### 3. A GGUF model file
+### 4. A GGUF model file
 
 #### Recommended models (≤16 GB RAM)
 
@@ -75,7 +83,9 @@ You don't need to add it to `PATH` — you'll point LocalBot at it directly via 
 | `coding` | Qwen3-Coder-30B-A3B (MoE) | Q4_K_M | ~18 GB |
 | `reasoning` | Qwen3.5-27B Reasoning-Distilled v2 | Q4_K_M | ~18 GB |
 
-### 4. A Discord Bot Token *(Discord mode only)*
+Place your model file(s) in `C:\Llama\Models\` — this folder is mounted into the container as `/models`.
+
+### 5. A Discord Bot Token *(Discord mode only)*
 
 1. Go to the [Discord Developer Portal](https://discord.com/developers/applications) and create a new application.
 2. Under **Bot**, click **Add Bot** and copy the token.
@@ -86,14 +96,111 @@ You don't need to add it to `PATH` — you'll point LocalBot at it directly via 
 
 ## Setup
 
-### 1. Clone and install
+### Option A — Docker Compose (recommended)
 
-```bash
+This is the fastest path. Docker handles the Python environment, llama-server binary, and all services.
+
+#### 1. Clone the repo
+
+```powershell
 git clone https://github.com/dmg10007/LocalBot.git
-cd LocalBot
-python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\Activate.ps1
+Set-Location LocalBot
+```
 
+#### 2. Create your `.env` file
+
+```powershell
+Copy-Item .env.example .env
+```
+
+Open `.env` in your editor and fill in the required values:
+
+```powershell
+notepad .env
+```
+
+| Variable | Required | Description |
+|---|---|---|
+| `DISCORD_BOT_TOKEN` | ✅ *(Discord mode)* | Bot token from the Developer Portal |
+| `GITHUB_TOKEN` | — | GitHub PAT for the MCP server (`repo`, `read:org`) |
+| `WEBUI_API_KEY` | ✅ *(if exposed off-loopback)* | Shared secret between OpenWebUI and the API bridge |
+| `SLOT_0_MODEL` | ✅ | Container path to your `.gguf` file (e.g. `/models/my-model-q4_k_m.gguf`) |
+| `LLAMA_CTX_SIZE` | — | Context window size. Default `4096` |
+
+See [`.env.example`](.env.example) for all options with inline descriptions.
+
+> **Generate a secure `WEBUI_API_KEY`:**
+> ```powershell
+> python -c "import secrets; print(secrets.token_urlsafe(32))"
+> ```
+
+#### 3. Create required local directories
+
+```powershell
+New-Item -ItemType Directory -Force -Path logs, storage, sandbox
+```
+
+#### 4. Start all services
+
+```powershell
+docker compose up -d
+```
+
+This starts:
+- **`localbot`** — Discord bot + llama-server subprocess on the inference budget
+- **`localbot-webui`** — OpenAI-compatible FastAPI bridge on `http://localhost:8080`
+- **`github-mcp-server`** — GitHub MCP server on `http://localhost:8181`
+- **`openwebui`** — Browser UI on `http://localhost:3000`
+
+#### 5. Check service health
+
+```powershell
+docker compose ps
+```
+
+All four containers should show `running`. Check logs for any individual service:
+
+```powershell
+docker compose logs -f localbot
+docker compose logs -f github-mcp-server
+```
+
+#### 6. Stopping and restarting
+
+```powershell
+# Stop all services (preserves data)
+docker compose down
+
+# Restart a single service after a config change
+docker compose up -d --force-recreate localbot
+
+# Rebuild the image after a code change
+docker compose up -d --build localbot
+```
+
+---
+
+### Option B — Local Python (no Docker)
+
+Use this if you want to run LocalBot directly on your machine without containers.
+
+#### 1. Clone and create a virtual environment
+
+```powershell
+git clone https://github.com/dmg10007/LocalBot.git
+Set-Location LocalBot
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+```
+
+> If you get an execution policy error, run:
+> ```powershell
+> Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+> ```
+
+#### 2. Install dependencies
+
+```powershell
 # Core (Discord bot only)
 pip install -e .
 
@@ -104,19 +211,20 @@ pip install -e ".[webui]"
 pip install -e ".[dev]"
 ```
 
-### 2. Configure
+#### 3. Configure
 
-```bash
-cp .env.example .env
+```powershell
+Copy-Item .env.example .env
+notepad .env
 ```
 
-Minimum required variables:
+Set at minimum:
 
 | Variable | Required | Description |
 |---|---|---|
 | `DISCORD_BOT_TOKEN` | ✅ *(Discord mode)* | Bot token from the Developer Portal |
 | `LLAMA_SERVER_MODEL_PATH` | ✅ | Absolute path to your `.gguf` model file |
-| `LLAMA_SERVER_EXECUTABLE` | ✅ | Full path to the `llama-server` binary |
+| `LLAMA_SERVER_EXECUTABLE` | ✅ | Full path to `llama-server.exe` |
 | `LLAMA_SERVER_N_GPU_LAYERS` | — | `0` = CPU (default), `-1` = all layers on GPU |
 | `BRAVE_API_KEY` | — | Leave blank to disable web search |
 | `LLAMA_SERVER_MODEL_FAMILY` | — | Leave blank for auto-detection |
@@ -125,29 +233,27 @@ Minimum required variables:
 | `SANDBOX_ROOT` | — | Directory the LLM may read/write. Defaults to `./sandbox` |
 | `WEBUI_API_KEY` | — | Bearer token for the HTTP API. Leave blank to disable auth |
 
-Configuration is validated at startup via **pydantic-settings** — missing required fields produce a clear error message immediately rather than crashing mid-request.
+#### 4. Create required directories
 
-See [`.env.example`](.env.example) for all options.
-
-### 3. Create required directories
-
-```bash
-mkdir -p logs storage sandbox
+```powershell
+New-Item -ItemType Directory -Force -Path logs, storage, sandbox
 ```
 
-### 4. Run
+#### 5. Run
 
 **Discord mode:**
-```bash
+```powershell
 localbot
 ```
 
 **HTTP / OpenWebUI mode:**
-```bash
+```powershell
 localbot-webui
 ```
 
-`llama-server` starts automatically as a subprocess. Its stdout/stderr (including crashes, OOM errors, CUDA failures) are captured and forwarded to the application log. If a newer llama.cpp build is available you will be prompted:
+`llama-server` starts automatically as a subprocess. Its stdout/stderr (including crashes, OOM errors, CUDA failures) are captured and forwarded to the application log.
+
+If a newer llama.cpp build is available you will be prompted:
 
 ```
 Install llama.cpp b9222? [y/N] (auto-skip in 30s):
@@ -157,72 +263,21 @@ Set `LLAMA_UPDATE_AUTO=true` in `.env` to install updates automatically.
 
 ---
 
-## Project Layout
-
-```
-src/localbot/
-├── app.py                   # Discord client, rate limiter, on_message handler
-├── commands.py              # Registered command handler table (jobs, timezone, clear, help…)
-├── agent.py                 # Core request/tool loop; slot acquisition; two-phase dispatch
-├── intent.py                # Intent classification (slot selection, workspace mode, needs_tools)
-├── prompts.py               # System prompts for each model slot
-├── webui.py                 # FastAPI OpenAI-compatible API layer for OpenWebUI
-├── config.py                # pydantic-settings config; validated at import time
-├── messaging.py             # Discord 2000-char message splitter
-├── adapters/
-│   ├── llamacpp_server.py       # llama-server subprocess lifecycle + log pipe
-│   ├── llamacpp_client.py       # HTTP client; model family detection; think-strip
-│   ├── model_registry.py        # Multi-slot manager; idle unload; hot-swap
-│   ├── llamacpp_updater.py      # Startup update check (GitHub Releases API)
-│   └── llamacpp_downloader.py   # Asset selection, streaming download, zip extraction
-├── tools/
-│   ├── registry.py          # Tool schemas + async dispatcher (timeout-guarded)
-│   ├── filesystem.py        # read/write/list/patch/search — sandboxed to SANDBOX_ROOT
-│   ├── log_reader.py        # read_logs — audit log reader for self-diagnostics
-│   ├── scheduler_tools.py   # LLM-callable schedule_job / cancel_job / list_jobs
-│   ├── search.py            # Brave Search + page fetch & summarise
-│   ├── reddit.py            # Reddit JSON API (no auth)
-│   └── time_tools.py        # Current time / timezone helpers
-├── scheduler/
-│   ├── service.py           # APScheduler wrapper; cron validation; atomic job-limit check
-│   └── store.py             # SQLite job persistence
-└── storage/
-    ├── db.py                # Schema initialisation
-    ├── history.py           # Per-user conversation history (SQLite, WAL, atomic trim)
-    └── audit.py             # Append-only JSONL audit log (thread-safe)
-tests/
-├── conftest.py
-├── test_agent_needs_tools.py
-├── test_llamacpp_family_detection.py
-├── test_messaging.py
-├── test_routing_dispatch_filesystem.py
-├── test_scheduler_validate_cron.py
-└── test_search_should_skip.py
-Dockerfile.webui
-docker-compose.yml
-```
-
----
-
 ## OpenWebUI Interface
 
 LocalBot exposes an OpenAI-compatible API that OpenWebUI connects to. The three model slots (`general`, `coding`, `reasoning`) appear as selectable models in the OpenWebUI picker.
 
-### Option A — Docker Compose (recommended)
+### Docker Compose (recommended)
 
-```bash
-docker compose up
-```
+After `docker compose up -d`, OpenWebUI is available at `http://localhost:3000` — no manual connection setup needed.
 
-Starts LocalBot API on `http://localhost:8080` and OpenWebUI on `http://localhost:3000`. No manual connection setup needed.
+### Standalone
 
-### Option B — Standalone
-
-```bash
-# Terminal 1
+```powershell
+# Terminal 1 — start the bot and inference engine
 localbot
 
-# Terminal 2
+# Terminal 2 — start the API bridge
 localbot-webui
 ```
 
@@ -290,7 +345,13 @@ When a coding request also requires external lookup (docs, API references, searc
 
 ## Swapping Models
 
-Update `LLAMA_SERVER_MODEL_PATH` in `.env` and restart. LocalBot queries `/v1/models` on startup, reads the loaded filename, and automatically applies the correct stop tokens and think-stripping for the detected family.
+Update `SLOT_0_MODEL` (or the relevant slot) in `.env` and restart:
+
+```powershell
+docker compose up -d --force-recreate localbot
+```
+
+LocalBot queries `/v1/models` on startup, reads the loaded filename, and automatically applies the correct stop tokens and think-stripping for the detected family.
 
 | Family | Matched by filename | Think-strip |
 |---|---|---|
@@ -348,7 +409,10 @@ The LLM translates to cron and calls `schedule_job`. The bot only confirms a job
 
 ## Development
 
-```bash
+```powershell
+# Activate the virtual environment
+.venv\Scripts\Activate.ps1
+
 # Lint + format
 ruff check .
 ruff format .
@@ -361,6 +425,53 @@ pytest
 ```
 
 The test suite uses `conftest.py` to stub `localbot.config` and optional heavy dependencies before collection, so `pytest` works without a running bot or llama-server.
+
+---
+
+## Project Layout
+
+```
+src/localbot/
+├── app.py                   # Discord client, rate limiter, on_message handler
+├── commands.py              # Registered command handler table (jobs, timezone, clear, help…)
+├── agent.py                 # Core request/tool loop; slot acquisition; two-phase dispatch
+├── intent.py                # Intent classification (slot selection, workspace mode, needs_tools)
+├── prompts.py               # System prompts for each model slot
+├── webui.py                 # FastAPI OpenAI-compatible API layer for OpenWebUI
+├── config.py                # pydantic-settings config; validated at import time
+├── messaging.py             # Discord 2000-char message splitter
+├── adapters/
+│   ├── llamacpp_server.py       # llama-server subprocess lifecycle + log pipe
+│   ├── llamacpp_client.py       # HTTP client; model family detection; think-strip
+│   ├── model_registry.py        # Multi-slot manager; idle unload; hot-swap
+│   ├── llamacpp_updater.py      # Startup update check (GitHub Releases API)
+│   └── llamacpp_downloader.py   # Asset selection, streaming download, zip extraction
+├── tools/
+│   ├── registry.py          # Tool schemas + async dispatcher (timeout-guarded)
+│   ├── filesystem.py        # read/write/list/patch/search — sandboxed to SANDBOX_ROOT
+│   ├── log_reader.py        # read_logs — audit log reader for self-diagnostics
+│   ├── scheduler_tools.py   # LLM-callable schedule_job / cancel_job / list_jobs
+│   ├── search.py            # Brave Search + page fetch & summarise
+│   ├── reddit.py            # Reddit JSON API (no auth)
+│   └── time_tools.py        # Current time / timezone helpers
+├── scheduler/
+│   ├── service.py           # APScheduler wrapper; cron validation; atomic job-limit check
+│   └── store.py             # SQLite job persistence
+└── storage/
+    ├── db.py                # Schema initialisation
+    ├── history.py           # Per-user conversation history (SQLite, WAL, atomic trim)
+    └── audit.py             # Append-only JSONL audit log (thread-safe)
+tests/
+├── conftest.py
+├── test_agent_needs_tools.py
+├── test_llamacpp_family_detection.py
+├── test_messaging.py
+├── test_routing_dispatch_filesystem.py
+├── test_scheduler_validate_cron.py
+└── test_search_should_skip.py
+Dockerfile
+docker-compose.yml
+```
 
 ---
 
