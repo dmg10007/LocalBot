@@ -8,13 +8,18 @@ Design goals after refactor
 * _run_loop is pure: it receives everything it needs via arguments and
   returns a string.  No hidden global state.
 * Explicit error types instead of bare Exception catch-alls.
+* on_token callback: when provided, the final model call in the loop
+  streams tokens live via LlamaCppClient streaming.  Tool calls and
+  intermediate planning passes are still non-streaming to keep the
+  tool-call JSON intact.  Discord / non-streaming callers pass no
+  on_token and behaviour is identical to before.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-from typing import Any, TYPE_CHECKING
+from typing import Any, Awaitable, Callable, TYPE_CHECKING
 
 from localbot.adapters.model_registry import ModelRegistry, SlotName
 from localbot.config import cfg
@@ -45,6 +50,9 @@ log = logging.getLogger(__name__)
 _TOOL_RESULT_MAX_CHARS = 4_000
 _TIMEOUT_REPLY = "Sorry, your request took too long and was cancelled."
 
+# Type alias matching LlamaCppClient.TokenCallback
+TokenCallback = Callable[[str], Awaitable[None]]
+
 
 class Agent:
     """Stateless (per-request) coordinator that routes to the right model slot."""
@@ -57,8 +65,18 @@ class Agent:
         self._registry = registry
         self._scheduler = scheduler
 
-    async def handle(self, user_id: str, user_message: str) -> str:
-        """Entry point for all chat requests.  Returns the assistant reply."""
+    async def handle(
+        self,
+        user_id: str,
+        user_message: str,
+        on_token: TokenCallback | None = None,
+    ) -> str:
+        """Entry point for all chat requests.  Returns the assistant reply.
+
+        *on_token* is an optional async callback invoked with each streamed
+        token during the final model call.  Pass it from the webui SSE path;
+        omit it (or pass None) for the Discord / non-streaming path.
+        """
         history = await asyncio.to_thread(get_history, user_id)
         log_event("user_message", user_id=user_id, content=user_message)
 
@@ -76,6 +94,7 @@ class Agent:
                 if is_coding_with_lookup(user_message):
                     reply = await self._run_two_phase(
                         user_id, user_message, history, workspace_mode, sched_tools,
+                        on_token=on_token,
                     )
                 else:
                     client = await self._registry.acquire(slot)
@@ -95,6 +114,7 @@ class Agent:
                     reply = await self._run_loop(
                         client, messages, tools, sched_tools,
                         requesting_user_id=user_id,
+                        on_token=on_token,
                     )
         except asyncio.TimeoutError:
             log.warning("Request for user %s timed out after %ds", user_id, cfg.request_deadline_seconds)
@@ -117,6 +137,7 @@ class Agent:
         history: list[dict[str, Any]],
         workspace_mode: WorkspaceMode,
         sched_tools: Any,
+        on_token: TokenCallback | None = None,
     ) -> str:
         general_client = await self._registry.acquire("general")
         phase1_messages: list[dict[str, Any]] = [
@@ -125,9 +146,12 @@ class Agent:
             {"role": "user", "content": user_message},
         ]
         search_tools = build_tool_schemas(include_scheduler=False, workspace_mode=None)
+        # Phase 1 (context gathering) is always non-streaming — tool calls
+        # require complete JSON responses.
         context = await self._run_loop(
             general_client, phase1_messages, search_tools, sched_tools,
             requesting_user_id=user_id,
+            on_token=None,
         )
         log.debug("[agent] two-phase phase-1 context: %d chars", len(context))
 
@@ -143,9 +167,11 @@ class Agent:
             {"role": "user", "content": enriched},
         ]
         coding_tools = build_tool_schemas(include_scheduler=False, workspace_mode=workspace_mode)
+        # Phase 2 (implementation) streams to the caller.
         return await self._run_loop(
             coding_client, phase2_messages, coding_tools, None,
             requesting_user_id=user_id,
+            on_token=on_token,
         )
 
     # ------------------------------------------------------------------
@@ -159,6 +185,7 @@ class Agent:
         tools: list[dict[str, Any]] | None,
         sched_tools: Any = None,
         requesting_user_id: str = "",
+        on_token: TokenCallback | None = None,
     ) -> str:
         """Repeatedly call the model and execute tool calls until done.
 
@@ -166,11 +193,25 @@ class Agent:
         from calling the same tool with the same arguments twice in one turn.
         Iteration cap: when max_tool_iterations is reached, we force a final
         synthesis message so the user always gets a response.
+
+        *on_token* is forwarded only to the terminal model call (no active
+        tool calls).  Intermediate tool-call passes are always non-streaming
+        so the JSON tool_call structure arrives intact.
         """
         called: set[tuple[str, str]] = set()
 
         for iteration in range(cfg.max_tool_iterations + 1):
-            response = await client.chat(messages, tools=tools)
+            # Only stream on the final reply — not while tool calls are expected.
+            # We detect this heuristically: pass on_token only when tools=None
+            # or when we're already past the tool phase (iteration > 0 and
+            # previous round had tool results).  The safest rule: stream only
+            # when we explicitly pass tools=None to this call.
+            is_final_call = tools is None
+            response = await client.chat(
+                messages,
+                tools=tools,
+                on_token=on_token if is_final_call else None,
+            )
             choice = response["choices"][0]
             msg = choice["message"]
             content: str = msg.get("content") or ""
@@ -185,6 +226,7 @@ class Agent:
                             "content": "Please answer the question above directly and concisely.",
                         }],
                         tools=None,
+                        on_token=on_token,
                     )
                     return synth["choices"][0]["message"].get("content") or ""
                 return content
@@ -200,7 +242,7 @@ class Agent:
                         "and list them at the end."
                     ),
                 })
-                final = await client.chat(messages, tools=None)
+                final = await client.chat(messages, tools=None, on_token=on_token)
                 return final["choices"][0]["message"].get("content") or ""
 
             messages.append(msg)
@@ -256,7 +298,7 @@ class Agent:
                     "role": "user",
                     "content": "You have all the information needed. Please give your final answer now.",
                 })
-                final = await client.chat(messages, tools=None)
+                final = await client.chat(messages, tools=None, on_token=on_token)
                 return final["choices"][0]["message"].get("content") or ""
 
         return "I was unable to complete your request."

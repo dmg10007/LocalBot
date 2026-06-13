@@ -12,14 +12,18 @@ Changes vs original
   with different families are handled correctly.
 * _get_session() is removed — session is created in __init__ and closed in
   close().  Lazy re-creation in a closed-check is a concurrency footgun.
+* chat() accepts an optional on_token callback; when provided it switches to
+  stream:true against llama-server and forwards each content delta live.
+  The non-streaming path is completely unchanged.
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 import aiohttp
 
@@ -29,6 +33,9 @@ if TYPE_CHECKING:
     from localbot.adapters.llamacpp_server import LlamaCppServer
 
 log = logging.getLogger(__name__)
+
+# Type alias for the streaming token callback.
+TokenCallback = Callable[[str], Awaitable[None]]
 
 
 class ModelFamily(Enum):
@@ -176,8 +183,14 @@ class LlamaCppClient:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        on_token: TokenCallback | None = None,
     ) -> dict[str, Any]:
         """POST /v1/chat/completions and return the parsed response dict.
+
+        When *on_token* is provided the request is made with stream=True and
+        each content delta is forwarded to the callback as it arrives.  The
+        return value is a synthetic non-streaming response dict so callers
+        (e.g. the tool loop) can be written once and work for both paths.
 
         Raises RuntimeError on non-2xx HTTP responses so callers receive a
         clear error instead of an aiohttp.ClientResponseError with raw bytes.
@@ -192,9 +205,11 @@ class LlamaCppClient:
                 "or tool-result truncation.",
                 prompt_tokens, cfg.llama_server_ctx_size, max_tokens,
             )
+
+        use_stream = on_token is not None
         payload: dict[str, Any] = {
             "messages": messages,
-            "stream": False,
+            "stream": use_stream,
             "temperature": cfg.model_temperature,
             "top_p": 0.9,
             "max_tokens": max_tokens,
@@ -222,6 +237,71 @@ class LlamaCppClient:
                 f"llama-server returned HTTP {resp.status}: {body[:200]}"
             )
 
+        # ------------------------------------------------------------------
+        # Streaming path — consume SSE, forward tokens, build synthetic resp
+        # ------------------------------------------------------------------
+        if use_stream:
+            full_content = ""
+            tool_calls: list[dict[str, Any]] = []
+            finish_reason: str | None = None
+
+            async for raw_line in resp.content:
+                line = raw_line.decode("utf-8").strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                data_str = line[len("data:"):].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+
+                choice = (chunk.get("choices") or [{}])[0]
+                delta = choice.get("delta", {})
+                finish_reason = choice.get("finish_reason") or finish_reason
+
+                # Accumulate tool_calls deltas (index-keyed)
+                for tc_delta in delta.get("tool_calls") or []:
+                    idx = tc_delta.get("index", 0)
+                    while len(tool_calls) <= idx:
+                        tool_calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                    if tc_delta.get("id"):
+                        tool_calls[idx]["id"] = tc_delta["id"]
+                    fn = tc_delta.get("function", {})
+                    if fn.get("name"):
+                        tool_calls[idx]["function"]["name"] += fn["name"]
+                    if fn.get("arguments"):
+                        tool_calls[idx]["function"]["arguments"] += fn["arguments"]
+
+                # Forward content token to caller
+                token = delta.get("content") or ""
+                if token:
+                    full_content += token
+                    await on_token(token)  # type: ignore[misc]
+
+            # Strip thinking blocks from the accumulated content
+            is_thinking = self._family in _THINKING_FAMILIES
+            synthetic_msg: dict[str, Any] = {"role": "assistant", "content": full_content}
+            if tool_calls:
+                synthetic_msg["tool_calls"] = tool_calls
+                synthetic_msg["content"] = None
+            elif is_thinking:
+                synthetic_msg["content"] = strip_thinking(synthetic_msg)
+            else:
+                synthetic_msg["content"] = full_content.strip()
+
+            return {
+                "choices": [{
+                    "index": 0,
+                    "message": synthetic_msg,
+                    "finish_reason": finish_reason or "stop",
+                }]
+            }
+
+        # ------------------------------------------------------------------
+        # Non-streaming path — unchanged
+        # ------------------------------------------------------------------
         data: dict[str, Any] = await resp.json()
         is_thinking = self._family in _THINKING_FAMILIES
         for choice in data.get("choices", []):

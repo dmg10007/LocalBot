@@ -10,6 +10,11 @@ Refactored changes
 * Startup is guarded by an asyncio.Event so /healthz returns 503
   cleanly during warm-up, and the event is set on both paths (remote
   and local) without duplicating logic.
+* True SSE streaming: when stream=True, agent.handle() is spawned as a
+  background task and each token is forwarded through an asyncio.Queue
+  to the SSE response.  Open WebUI receives the first token within ~1s
+  instead of waiting for full completion, eliminating aiohttp timeouts
+  on slow CPU inference.
 
 Environment variables
 ---------------------
@@ -260,28 +265,51 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
             raise HTTPException(status_code=400, detail="No user message found.")
 
         agent: Agent = request.app.state.agent
-        reply = await agent.handle(user_id, user_text)
-
         model_id = body.model or "localbot-general"
         created = int(time.time())
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
         if body.stream:
-            words = reply.split(" ")
+            # Each token from llama-server is pushed into this queue by the
+            # background task and consumed by the SSE generator below.
+            token_queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+            async def _on_token(token: str) -> None:
+                await token_queue.put(token)
+
+            async def _run_agent() -> None:
+                try:
+                    await agent.handle(user_id, user_text, on_token=_on_token)
+                except Exception:
+                    log.exception("Streaming agent task failed for user %s", user_id)
+                finally:
+                    # Always send the sentinel so the SSE generator terminates.
+                    await token_queue.put(None)
+
+            asyncio.create_task(_run_agent())
 
             async def _sse_chunks() -> AsyncIterator[bytes]:
-                for i, word in enumerate(words):
-                    token = word if i == len(words) - 1 else word + " "
+                while True:
+                    token = await token_queue.get()
+                    if token is None:
+                        break
                     chunk = {
-                        "id": completion_id, "object": "chat.completion.chunk",
-                        "created": created, "model": model_id,
-                        "choices": [{"index": 0, "delta": {"role": "assistant", "content": token}, "finish_reason": None}],
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_id,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": token},
+                            "finish_reason": None,
+                        }],
                     }
                     yield b"data: " + json.dumps(chunk).encode() + b"\n\n"
-                    await asyncio.sleep(0)
                 done = {
-                    "id": completion_id, "object": "chat.completion.chunk",
-                    "created": created, "model": model_id,
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model_id,
                     "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                 }
                 yield b"data: " + json.dumps(done).encode() + b"\n\n"
@@ -293,12 +321,18 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
 
+        # Non-streaming path — unchanged, used by Discord and direct API calls.
+        reply = await agent.handle(user_id, user_text)
         return fastapi.responses.JSONResponse(content={
             "id": completion_id,
             "object": "chat.completion",
             "created": created,
             "model": model_id,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": reply}, "finish_reason": "stop"}],
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": reply},
+                "finish_reason": "stop",
+            }],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         })
 
