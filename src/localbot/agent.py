@@ -199,14 +199,18 @@ class Agent:
         so the JSON tool_call structure arrives intact.
         """
         called: set[tuple[str, str]] = set()
+        # Track whether we have entered at least one tool-call round.
+        # After tool results are appended the next call is always final,
+        # so we must pass on_token regardless of whether tools= is set.
+        has_done_tool_calls: bool = False
 
         for iteration in range(cfg.max_tool_iterations + 1):
-            # Only stream on the final reply — not while tool calls are expected.
-            # We detect this heuristically: pass on_token only when tools=None
-            # or when we're already past the tool phase (iteration > 0 and
-            # previous round had tool results).  The safest rule: stream only
-            # when we explicitly pass tools=None to this call.
-            is_final_call = tools is None
+            # Stream on the final reply pass.  A pass is "final" when:
+            #   (a) tools were never provided (pure chat), OR
+            #   (b) we already executed at least one tool round — the model
+            #       is now synthesising its answer from tool results and will
+            #       not emit further tool_calls.
+            is_final_call = (tools is None) or has_done_tool_calls
             response = await client.chat(
                 messages,
                 tools=tools,
@@ -269,6 +273,7 @@ class Agent:
 
                 called.add(dedup_key)
                 any_new = True
+                has_done_tool_calls = True
 
                 log.info("Tool call: %s(%s)", name, args)
                 log_event("tool_call", tool=name, args=args)
