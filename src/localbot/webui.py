@@ -42,6 +42,10 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, List, Optional, Protocol, Union, runtime_checkable
 
+# Import at module level so FastAPI always recognises it as the special
+# Starlette Request type regardless of where routes are defined.
+from starlette.requests import Request
+
 from pydantic import BaseModel
 
 log = logging.getLogger(__name__)
@@ -90,7 +94,7 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
     _require_fastapi()
 
     import fastapi
-    from fastapi import Depends, HTTPException, Request, status
+    from fastapi import Depends, HTTPException, status
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import StreamingResponse
     from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -209,6 +213,10 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
         token_id = hashlib.sha256(creds.credentials.encode()).hexdigest()[:16]
         return f"{USER_PREFIX}{token_id}"
 
+    def _get_agent(request: Request) -> Agent:
+        _check_ready(request.app.state)
+        return request.app.state.agent  # type: ignore[no-any-return]
+
     def _check_ready(app_state: Any) -> None:
         event: asyncio.Event = app_state.ready_event
         if not event.is_set():
@@ -238,12 +246,10 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
 
     @app.post("/v1/chat/completions")
     async def chat_completions(
-        request: Request,
         body: ChatCompletionRequest,
         user_id: str = Depends(_get_user_id),
+        agent: Agent = Depends(_get_agent),
     ) -> fastapi.Response:
-        _check_ready(request.app.state)
-
         # Per-user rate limiting (mirrors Discord behaviour).
         now = time.monotonic()
         remaining = cfg.rate_limit_seconds - (now - _rate_last.get(user_id, 0.0))
@@ -263,7 +269,6 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
         if not user_text:
             raise HTTPException(status_code=400, detail="No user message found.")
 
-        agent: Agent = request.app.state.agent
         model_id = body.model or "localbot-general"
         created = int(time.time())
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
