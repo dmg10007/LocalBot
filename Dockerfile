@@ -7,7 +7,7 @@
 # We keep the full release in /opt/llama AND symlink every .so into
 # /usr/local/bin/ (next to the binary) so both resolution paths work.
 
-# ── Stage 1: download llama-server + shared libs ────────────────────────
+# ── Stage 1: download llama-server + shared libs ──────────────────────
 FROM python:3.11-slim AS llama
 
 ARG LLAMA_VERSION=b9592
@@ -20,7 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl tar \
 RUN mkdir -p /opt/llama \
     && curl -fsSL "$LLAMA_URL" | tar -xz --strip-components=1 -C /opt/llama
 
-# ── Stage 2: application image ────────────────────────────────────────────
+# ── Stage 2: application image ──────────────────────────────────────
 FROM python:3.11-slim AS base
 
 ARG EXTRA=""
@@ -40,8 +40,10 @@ RUN cp /opt/llama/llama-server /usr/local/bin/llama-server && \
     ldconfig
 
 # Install build deps (needed for some aiohttp/lxml wheels on slim)
+# gosu is used by entrypoint.sh to drop privileges cleanly after chown.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
+    gosu \
     libffi-dev \
     && rm -rf /var/lib/apt/lists/*
 
@@ -61,6 +63,9 @@ RUN mkdir -p storage logs sandbox \
     && useradd --system --gid localbot --home-dir /app --no-create-home localbot \
     && chown -R localbot:localbot /app
 
-USER localbot
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
+# Entrypoint runs as root to fix bind-mount ownership, then execs as localbot.
+ENTRYPOINT ["/entrypoint.sh"]
 CMD ["python", "-m", "localbot"]
