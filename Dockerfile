@@ -64,7 +64,8 @@ RUN mkdir -p storage logs sandbox \
     && chown -R localbot:localbot /app
 
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+# Strip Windows CRLF line endings that break the shebang, then make executable.
+RUN sed -i 's/\r//' /entrypoint.sh && chmod +x /entrypoint.sh
 
 # Entrypoint runs as root to fix bind-mount ownership, then execs as localbot.
 ENTRYPOINT ["/entrypoint.sh"]
