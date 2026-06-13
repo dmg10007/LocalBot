@@ -6,7 +6,6 @@ Refactored changes
   untyped inline class — mypy can verify it.
 * chat_completions() no longer creates a redundant asyncio.Future;
   it simply awaits agent.handle() directly (both run on the same loop).
-* Rate limiting for web UI requests (mirrors Discord behaviour).
 * Startup is guarded by an asyncio.Event so /healthz returns 503
   cleanly during warm-up, and the event is set on both paths (remote
   and local) without duplicating logic.
@@ -15,6 +14,14 @@ Refactored changes
   to the SSE response.  Open WebUI receives the first token within ~1s
   instead of waiting for full completion, eliminating aiohttp timeouts
   on slow CPU inference.
+
+Note on rate limiting
+---------------------
+The webui endpoint is a trusted, local-network-only service fronted by
+OpenWebUI.  OpenWebUI fires multiple POST /v1/chat/completions requests
+per user turn (completion + auto-title generation), so a per-user cooldown
+would silently swallow the title request and produce an empty response.
+Rate limiting is handled at the Discord adapter layer instead.
 
 Environment variables
 ---------------------
@@ -108,7 +115,6 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
 
     API_KEY: str | None = os.environ.get("WEBUI_API_KEY") or None
     USER_PREFIX: str = os.environ.get("WEBUI_USER_PREFIX", "webui:")
-    _rate_last: dict[str, float] = {}
 
     # Fail closed: a network-exposed LLM proxy must not run unauthenticated.
     # Set WEBUI_ALLOW_NO_AUTH=1 only for a trusted, loopback-only deployment.
@@ -250,16 +256,6 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
         user_id: str = Depends(_get_user_id),
         agent: Agent = Depends(_get_agent),
     ) -> fastapi.Response:
-        # Per-user rate limiting (mirrors Discord behaviour).
-        now = time.monotonic()
-        remaining = cfg.rate_limit_seconds - (now - _rate_last.get(user_id, 0.0))
-        if remaining > 0:
-            raise HTTPException(
-                status_code=429,
-                detail=f"Rate limited. Retry in {remaining:.1f}s.",
-            )
-        _rate_last[user_id] = now
-
         user_text = ""
         for m in reversed(body.messages):
             if m.role == "user":
@@ -325,7 +321,7 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
 
-        # Non-streaming path — unchanged, used by Discord and direct API calls.
+        # Non-streaming path — used by title generation and direct API calls.
         reply = await agent.handle(user_id, user_text)
         return fastapi.responses.JSONResponse(content={
             "id": completion_id,
