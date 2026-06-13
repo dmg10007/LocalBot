@@ -194,7 +194,6 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
     _bearer = HTTPBearer(auto_error=False)
 
     def _get_user_id(
-        request: Request,
         creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
     ) -> str:
         if API_KEY is None:
