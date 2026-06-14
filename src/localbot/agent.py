@@ -8,11 +8,11 @@ Design goals after refactor
 * _run_loop is pure: it receives everything it needs via arguments and
   returns a string.  No hidden global state.
 * Explicit error types instead of bare Exception catch-alls.
-* on_token callback: when provided, the final model call in the loop
-  streams tokens live via LlamaCppClient streaming.  Tool calls and
-  intermediate planning passes are still non-streaming to keep the
-  tool-call JSON intact.  Discord / non-streaming callers pass no
-  on_token and behaviour is identical to before.
+* on_token callback: when provided, every model call streams live tokens.
+  Tool-call chunk deltas are accumulated inside LlamaCppClient and never
+  forwarded to on_token, so the caller only sees user-visible content.
+  This means we no longer need to gate on_token behind is_final_call —
+  the client layer already suppresses tool-call tokens.
 """
 from __future__ import annotations
 
@@ -189,32 +189,24 @@ class Agent:
     ) -> str:
         """Repeatedly call the model and execute tool calls until done.
 
+        on_token is passed to every client.chat() call.  LlamaCppClient
+        suppresses tool-call delta tokens internally — only user-visible
+        content tokens reach the callback.  This means we no longer need
+        the is_final_call gate; streaming works correctly on the very first
+        pass even when tools are available.
+
         Deduplication: (name, canonical-args-json) pairs prevent the model
         from calling the same tool with the same arguments twice in one turn.
         Iteration cap: when max_tool_iterations is reached, we force a final
         synthesis message so the user always gets a response.
-
-        *on_token* is forwarded only to the terminal model call (no active
-        tool calls).  Intermediate tool-call passes are always non-streaming
-        so the JSON tool_call structure arrives intact.
         """
         called: set[tuple[str, str]] = set()
-        # Track whether we have entered at least one tool-call round.
-        # After tool results are appended the next call is always final,
-        # so we must pass on_token regardless of whether tools= is set.
-        has_done_tool_calls: bool = False
 
         for iteration in range(cfg.max_tool_iterations + 1):
-            # Stream on the final reply pass.  A pass is "final" when:
-            #   (a) tools were never provided (pure chat), OR
-            #   (b) we already executed at least one tool round — the model
-            #       is now synthesising its answer from tool results and will
-            #       not emit further tool_calls.
-            is_final_call = (tools is None) or has_done_tool_calls
             response = await client.chat(
                 messages,
                 tools=tools,
-                on_token=on_token if is_final_call else None,
+                on_token=on_token,
             )
             choice = response["choices"][0]
             msg = choice["message"]
@@ -273,7 +265,6 @@ class Agent:
 
                 called.add(dedup_key)
                 any_new = True
-                has_done_tool_calls = True
 
                 log.info("Tool call: %s(%s)", name, args)
                 log_event("tool_call", tool=name, args=args)
