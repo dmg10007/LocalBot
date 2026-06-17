@@ -1,0 +1,93 @@
+From 3e0467e6c38ece9c43aa67b83cd133189e774098 Mon Sep 17 00:00:00 2001
+From: Claude <localbot-claude@users.noreply.github.com>
+Date: Wed, 17 Jun 2026 20:47:18 +0000
+Subject: [PATCH] fix: --flash-attn requires explicit value on llama.cpp b9xxx+
+ builds
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The Dockerfile pins LLAMA_VERSION=b9592 (released 2026-06-10). Recent
+llama-server builds changed --flash-attn from a bare boolean flag to
+an enum requiring an explicit value:
+
+    -fa, --flash-attn [on|off|auto]   (default: auto)
+
+The bare --flash-attn in LLAMA_SERVER_EXTRA_ARGS fails argument parsing
+on these builds and crashes llama-server immediately on startup:
+
+    RuntimeError: llama-server exited unexpectedly (exit code 1)
+    after 1 health-check attempt(s)
+
+Fix: use --flash-attn on explicitly in .env.example and README.
+
+Using 'on' rather than 'auto' deliberately — quantized V-cache
+(--cache-type-v q8_0) requires flash attention to actually be active;
+'auto' leaves that decision to the binary at runtime and risks a
+separate 'V cache quantization requires flash_attn' failure if it
+decides not to enable it.
+
+Affected: .env.example, README.md (Performance Tuning + Speculative
+Decoding sections), docker-compose.yml (tuning comment block).
+---
+ .env.example       | 2 +-
+ README.md          | 4 ++--
+ docker-compose.yml | 7 +++++--
+ 3 files changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/.env.example b/.env.example
+index e6b3355..8410bcf 100644
+--- a/.env.example
++++ b/.env.example
+@@ -83,7 +83,7 @@ LLAMA_CTX_SIZE=2048
+ # for the i5-10400H and are applied by docker-compose.yml.
+ # To enable speculative decoding, add:
+ #   --model-draft /models/your-draft-model-q4_k_m.gguf --draft-max 5 --draft-min 1
+-LLAMA_SERVER_EXTRA_ARGS=--flash-attn --cache-type-k q8_0 --cache-type-v q8_0 --ubatch-size 512
++LLAMA_SERVER_EXTRA_ARGS=--flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ubatch-size 512
+ 
+ # ── Sandbox ───────────────────────────────────────────────────────────────────
+ # Absolute path INSIDE the container that the filesystem tools are confined to.
+diff --git a/README.md b/README.md
+index 49f9fda..67b7c29 100644
+--- a/README.md
++++ b/README.md
+@@ -214,7 +214,7 @@ The following extra args are set via `LLAMA_SERVER_EXTRA_ARGS` in `.env`:
+ 
+ | Flag | Effect |
+ |---|---|
+-| `--flash-attn` | O(n) attention memory vs O(n²); cuts TTFT ~15–25% as history accumulates |
++| `--flash-attn on` | O(n) attention memory vs O(n²); cuts TTFT ~15–25% as history accumulates. Note: recent llama.cpp builds (b9xxx+) require an explicit value — `on`/`off`/`auto` — bare `--flash-attn` will fail to parse and crash the server on startup |
+ | `--cache-type-k q8_0` | 8-bit KV key cache; frees ~200–500 MB with negligible quality delta |
+ | `--cache-type-v q8_0` | 8-bit KV value cache |
+ | `--ubatch-size 512` | Micro-batch size for parallel prompt evaluation |
+@@ -226,7 +226,7 @@ Speculative decoding uses a small, fast draft model to generate candidate tokens
+ ```env
+ # .env
+ SLOT_DRAFT_MODEL=/models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+-LLAMA_SERVER_EXTRA_ARGS=--flash-attn --cache-type-k q8_0 --cache-type-v q8_0 --ubatch-size 512 --model-draft /models/qwen2.5-0.5b-instruct-q4_k_m.gguf --draft-max 5 --draft-min 1
++LLAMA_SERVER_EXTRA_ARGS=--flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ubatch-size 512 --model-draft /models/qwen2.5-0.5b-instruct-q4_k_m.gguf --draft-max 5 --draft-min 1
+ ```
+ 
+ RAM budget with speculative decoding on 16 GB:
+diff --git a/docker-compose.yml b/docker-compose.yml
+index b45f945..41d85a3 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -26,8 +26,11 @@
+ #   - LLAMA_ARG_MMAP=true            → memory-map model file; fast cold start, lower RSS
+ #
+ # Extra args passed via LLAMA_SERVER_EXTRA_ARGS (set in .env or override here):
+-#   --flash-attn                     → O(n) attention memory vs O(n²); cuts TTFT ~15-25% for
+-#                                       accumulated history; required for ctx > 2048
++#   --flash-attn on                  → O(n) attention memory vs O(n²); cuts TTFT ~15-25% for
++#                                       accumulated history; required for ctx > 2048.
++#                                       NOTE: must pass an explicit value (on/off/auto) on
++#                                       llama.cpp builds b9xxx+ — bare --flash-attn will fail
++#                                       to parse and crash llama-server on startup.
+ #   --cache-type-k q8_0              → 8-bit KV key cache; frees ~200-500 MB RAM vs fp16
+ #   --cache-type-v q8_0              → 8-bit KV value cache; negligible quality delta
+ #   --ubatch-size 512                → micro-batch for parallel prompt evaluation
+-- 
+2.43.0
+
