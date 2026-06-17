@@ -39,6 +39,14 @@ class LlamaCppServer:
             cmd += ["--threads", str(cfg.llama_server_threads)]
         if cfg.llama_server_extra_args:
             cmd += shlex.split(cfg.llama_server_extra_args)
+        # Speculative decoding: append draft model args when configured.
+        if cfg.slot_draft_model:
+            cmd += [
+                "--model-draft", cfg.slot_draft_model,
+                "--draft-max", str(cfg.slot_draft_max),
+                "--draft-min", "1",
+            ]
+            log.info("Speculative decoding enabled with draft model: %s", cfg.slot_draft_model)
 
         log.info("Starting llama-server: %s", " ".join(cmd))
         self._proc = await asyncio.create_subprocess_exec(

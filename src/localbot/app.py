@@ -115,6 +115,8 @@ class LocalBot(discord.Client):
         await search_module.close_session()
         await reddit_module.close_session()
         await self._registry.shutdown()
+        if self._agent._groq is not None:
+            await self._agent._groq.close()
         await super().close()
 
     # ------------------------------------------------------------------

@@ -162,3 +162,23 @@ def is_coding_with_lookup(message: str) -> bool:
         _SEARCH_INTENT.search(message)
         or re.search(r"\b(api|docs?|documentation|how to use|example)", message, re.IGNORECASE)
     )
+
+
+def is_groq_eligible(message: str, workspace_mode: WorkspaceMode) -> bool:
+    """Return True when a query is safe to route to Groq for speed.
+
+    Routing policy — never send to Groq when:
+    - Filesystem or GitHub workspace context is involved (private files/repos)
+    - Scheduler intent detected (user schedule data)
+    - Diagnostic intent detected (private audit log context)
+
+    Everything else — general chat, search, reasoning without personal
+    context — is eligible for the Groq fast path.
+    """
+    if workspace_mode is not None:
+        return False
+    if _SCHEDULE_INTENT.search(message) or _CANCEL_INTENT.search(message):
+        return False
+    if _DIAGNOSTIC_INTENT.search(message):
+        return False
+    return True

@@ -13,6 +13,9 @@ Design goals after refactor
   forwarded to on_token, so the caller only sees user-visible content.
   This means we no longer need to gate on_token behind is_final_call —
   the client layer already suppresses tool-call tokens.
+* Groq fast path: when GROQ_API_KEY is set and the query is eligible
+  (no filesystem/scheduler/diagnostics context), the request is routed
+  to Groq for sub-100 ms TTFT.  Falls back to the local model on error.
 """
 from __future__ import annotations
 
@@ -21,12 +24,14 @@ import json
 import logging
 from typing import Any, Awaitable, Callable, TYPE_CHECKING
 
+from localbot.adapters.groq_client import GroqClient
 from localbot.adapters.model_registry import ModelRegistry, SlotName
 from localbot.config import cfg
 from localbot.intent import (
     WorkspaceMode,
     detect_workspace_mode,
     is_coding_with_lookup,
+    is_groq_eligible,
     is_system_echo,
     needs_tools,
     select_slot,
@@ -64,6 +69,12 @@ class Agent:
     ) -> None:
         self._registry = registry
         self._scheduler = scheduler
+        # Groq client is instantiated once and reused; None when key not set.
+        self._groq: GroqClient | None = (
+            GroqClient(cfg.groq_api_key, model=cfg.groq_model)
+            if cfg.groq_api_key
+            else None
+        )
 
     async def handle(
         self,
@@ -96,25 +107,36 @@ class Agent:
                         user_id, user_message, history, workspace_mode, sched_tools,
                         on_token=on_token,
                     )
-                else:
-                    client = await self._registry.acquire(slot)
-                    messages: list[dict[str, Any]] = [
-                        {"role": "system", "content": system_prompt_for_slot(slot)},
-                        *history,
-                        {"role": "user", "content": user_message},
-                    ]
-                    tools = (
-                        build_tool_schemas(
-                            include_scheduler=sched_tools is not None,
-                            workspace_mode=workspace_mode,
+                elif (
+                    self._groq is not None
+                    and not needs_tools(user_message, history, sched_tools is not None, workspace_mode)
+                    and is_groq_eligible(user_message, workspace_mode)
+                ):
+                    # Groq fast path: eligible queries with no tool calls go here.
+                    # Falls back to local model on any error.
+                    try:
+                        messages_groq: list[dict[str, Any]] = [
+                            {"role": "system", "content": system_prompt_for_slot(slot)},
+                            *history,
+                            {"role": "user", "content": user_message},
+                        ]
+                        log.debug("[agent] routing to Groq (%s)", self._groq.model)
+                        reply = await self._groq.chat(
+                            messages_groq,
+                            on_token=on_token,
                         )
-                        if needs_tools(user_message, history, sched_tools is not None, workspace_mode)
-                        else None
-                    )
-                    reply = await self._run_loop(
-                        client, messages, tools, sched_tools,
-                        requesting_user_id=user_id,
-                        on_token=on_token,
+                        log_event("groq_reply", user_id=user_id, model=self._groq.model)
+                    except Exception as groq_exc:
+                        log.warning("Groq fast path failed (%s) — falling back to local model", groq_exc)
+                        # Fall through to local path below
+                        reply = await self._run_local(
+                            user_id, user_message, history, slot, workspace_mode,
+                            sched_tools, on_token,
+                        )
+                else:
+                    reply = await self._run_local(
+                        user_id, user_message, history, slot, workspace_mode,
+                        sched_tools, on_token,
                     )
         except asyncio.TimeoutError:
             log.warning("Request for user %s timed out after %ds", user_id, cfg.request_deadline_seconds)
@@ -125,6 +147,41 @@ class Agent:
             await asyncio.to_thread(append_message, user_id, "assistant", reply)
 
         return reply
+
+    # ------------------------------------------------------------------
+    # Local model dispatch (single-slot path)
+    # ------------------------------------------------------------------
+
+    async def _run_local(
+        self,
+        user_id: str,
+        user_message: str,
+        history: list[dict[str, Any]],
+        slot: SlotName,
+        workspace_mode: WorkspaceMode,
+        sched_tools: Any,
+        on_token: TokenCallback | None = None,
+    ) -> str:
+        """Acquire the appropriate local model slot and run the agent loop."""
+        client = await self._registry.acquire(slot)
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt_for_slot(slot)},
+            *history,
+            {"role": "user", "content": user_message},
+        ]
+        tools = (
+            build_tool_schemas(
+                include_scheduler=sched_tools is not None,
+                workspace_mode=workspace_mode,
+            )
+            if needs_tools(user_message, history, sched_tools is not None, workspace_mode)
+            else None
+        )
+        return await self._run_loop(
+            client, messages, tools, sched_tools,
+            requesting_user_id=user_id,
+            on_token=on_token,
+        )
 
     # ------------------------------------------------------------------
     # Two-phase: general model fetches context, coding model implements
