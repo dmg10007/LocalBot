@@ -87,9 +87,13 @@ class Config(BaseSettings):
     search_fetch_timeout_seconds: int = 8
 
     # ── Speculative decoding ─────────────────────────────────────────────────
-    # Path to a small draft model (0.5B–1B Q4_K_M).  When non-empty this is
-    # appended to LLAMA_SERVER_EXTRA_ARGS as --model-draft.  Leave blank to
-    # disable.  Set draft_max to tune the speculation window.
+    # Path to a small draft model (0.5B-1B Q4_K_M).  When non-empty,
+    # llamacpp_server.py automatically appends --spec-type draft-simple,
+    # --model-draft, and --spec-draft-n-max to the llama-server command line.
+    # Leave blank to disable.  Do not also pass --model-draft via
+    # llama_server_extra_args — that would duplicate the flag.
+    # Caveat: benchmarks show this is often net-negative on MoE models;
+    # prefer it for dense general/reasoning slots over MoE coding slots.
     slot_draft_model: str = ""
     slot_draft_max: int = 5
 

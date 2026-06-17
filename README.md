@@ -82,7 +82,7 @@ CPU-only inference on this hardware is **memory-bandwidth-bound** at ~35–38 GB
 
 > **Why not use the Intel UHD iGPU?** The UHD Graphics (GT2) shares system DDR4 memory. Offloading layers via Vulkan uses the same bus as the CPU and adds driver overhead, resulting in slower tok/s on this iGPU class. Keep `LLAMA_ARG_N_GPU_LAYERS=0`.
 
-> **Speculative decoding** adds ~0.4 GB for the draft model and delivers ~1.5–2× effective tok/s at 70–80% acceptance rates. Enable it by setting `SLOT_DRAFT_MODEL` and adding `--model-draft` to `LLAMA_SERVER_EXTRA_ARGS`. See [Speculative Decoding](#speculative-decoding) below.
+> **Speculative decoding** adds ~0.4 GB for the draft model and delivers ~1.5–2× effective tok/s at 70–80% acceptance rates **on dense models** — independent benchmarks show it's often net-negative on MoE models, so it's best applied to `general`/`reasoning` rather than the MoE `coding` slot above. Enable by setting `SLOT_DRAFT_MODEL` only (the required llama-server flags are appended automatically). See [Speculative Decoding](#speculative-decoding) below.
 
 #### Higher-RAM options (24–48 GB)
 
@@ -221,20 +221,23 @@ The following extra args are set via `LLAMA_SERVER_EXTRA_ARGS` in `.env`:
 
 ### Speculative Decoding
 
-Speculative decoding uses a small, fast draft model to generate candidate tokens that the main model verifies in a single forward pass. At 70–80% acceptance rates this delivers **~1.5–2× effective tok/s** with ~0.4 GB additional RAM.
+Speculative decoding uses a small, fast draft model to generate candidate tokens that the main model verifies in a single forward pass. At 70–80% acceptance rates this delivers **~1.5–2× effective tok/s** with ~0.4 GB additional RAM — **on dense models**.
+
+> **Caveat:** independent benchmarks show draft-model speculative decoding is often **net-negative on MoE models** (such as the Qwen3-Coder-4B-A1.3B recommended for the coding slot above). Drafted tokens still trigger fresh expert-weight loads during verification, eating the bandwidth savings the technique is meant to provide. Enable it for `general`/`reasoning` (both dense); benchmark before relying on it for `coding`.
+
+Set only `SLOT_DRAFT_MODEL` — `llamacpp_server.py` automatically appends the required `--spec-type draft-simple --model-draft --spec-draft-n-max` flags. Do **not** also add `--model-draft` to `LLAMA_SERVER_EXTRA_ARGS`; that duplicates the flag and llama-server will reject it.
 
 ```env
 # .env
 SLOT_DRAFT_MODEL=/models/qwen2.5-0.5b-instruct-q4_k_m.gguf
-LLAMA_SERVER_EXTRA_ARGS=--flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ubatch-size 512 --model-draft /models/qwen2.5-0.5b-instruct-q4_k_m.gguf --draft-max 5 --draft-min 1
+LLAMA_SERVER_EXTRA_ARGS=--flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ubatch-size 512
 ```
 
-RAM budget with speculative decoding on 16 GB:
+RAM budget with speculative decoding on 16 GB (dense slots only):
 
 | Active slots | Total RAM |
 |---|---|
 | General 3B + 0.5B draft | ~2.3 GB |
-| Coding 4B MoE + 0.5B draft | ~3.0 GB |
 | Reasoning 7B + 0.5B draft | ~6.2 GB |
 
 ### Groq Fast Path

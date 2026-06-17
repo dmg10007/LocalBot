@@ -40,11 +40,16 @@ class LlamaCppServer:
         if cfg.llama_server_extra_args:
             cmd += shlex.split(cfg.llama_server_extra_args)
         # Speculative decoding: append draft model args when configured.
+        # --draft-max/--draft-min were removed from llama-server (b9xxx+);
+        # replaced by --spec-draft-n-max/--spec-draft-n-min. --spec-type now
+        # defaults to "none" — passing --model-draft alone no longer implicitly
+        # enables speculative decoding, so --spec-type draft-simple is required.
         if cfg.slot_draft_model:
             cmd += [
+                "--spec-type", "draft-simple",
                 "--model-draft", cfg.slot_draft_model,
-                "--draft-max", str(cfg.slot_draft_max),
-                "--draft-min", "1",
+                "--spec-draft-n-max", str(cfg.slot_draft_max),
+                "--spec-draft-n-min", "1",
             ]
             log.info("Speculative decoding enabled with draft model: %s", cfg.slot_draft_model)
 
