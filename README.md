@@ -214,7 +214,7 @@ The following extra args are set via `LLAMA_SERVER_EXTRA_ARGS` in `.env`:
 
 | Flag | Effect |
 |---|---|
-| `--flash-attn` | O(n) attention memory vs O(n²); cuts TTFT ~15–25% as history accumulates |
+| `--flash-attn on` | O(n) attention memory vs O(n²); cuts TTFT ~15–25% as history accumulates. Note: recent llama.cpp builds (b9xxx+) require an explicit value — `on`/`off`/`auto` — bare `--flash-attn` will fail to parse and crash the server on startup |
 | `--cache-type-k q8_0` | 8-bit KV key cache; frees ~200–500 MB with negligible quality delta |
 | `--cache-type-v q8_0` | 8-bit KV value cache |
 | `--ubatch-size 512` | Micro-batch size for parallel prompt evaluation |
@@ -226,7 +226,7 @@ Speculative decoding uses a small, fast draft model to generate candidate tokens
 ```env
 # .env
 SLOT_DRAFT_MODEL=/models/qwen2.5-0.5b-instruct-q4_k_m.gguf
-LLAMA_SERVER_EXTRA_ARGS=--flash-attn --cache-type-k q8_0 --cache-type-v q8_0 --ubatch-size 512 --model-draft /models/qwen2.5-0.5b-instruct-q4_k_m.gguf --draft-max 5 --draft-min 1
+LLAMA_SERVER_EXTRA_ARGS=--flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ubatch-size 512 --model-draft /models/qwen2.5-0.5b-instruct-q4_k_m.gguf --draft-max 5 --draft-min 1
 ```
 
 RAM budget with speculative decoding on 16 GB:
