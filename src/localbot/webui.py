@@ -14,6 +14,9 @@ Refactored changes
   response.  The endpoint always streams — ignoring the client's stream
   flag — because OpenWebUI sends stream=False for external connections
   but still expects SSE chunks and silently drops a plain JSONResponse.
+* Full message context: the entire message list is parsed so that
+  system/tool messages injected by OpenWebUI (web search results, RAG
+  context) are forwarded to the agent rather than silently discarded.
 
 Note on rate limiting
 ---------------------
@@ -28,6 +31,9 @@ WEBUI_API_KEY       Bearer token required on every request.
                     When unset, auth is disabled.
 WEBUI_USER_PREFIX   Prefix prepended to the token to form the internal
                     user_id (default: "webui:").
+WEBUI_REQUEST_TIMEOUT
+                    Seconds before a hung agent task is cancelled and a
+                    504 is returned to OpenWebUI (default: 300).
 
 LLAMA_REMOTE_HOST   When set, the webui connects to this remote
                     llama-server instead of spawning its own process.
@@ -53,6 +59,9 @@ from starlette.requests import Request
 from pydantic import BaseModel
 
 log = logging.getLogger(__name__)
+
+# How long (seconds) to wait for agent.handle() before giving up.
+_REQUEST_TIMEOUT = int(os.environ.get("WEBUI_REQUEST_TIMEOUT", "300"))
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +101,63 @@ def _require_fastapi() -> None:
             "The 'webui' extra is required.  Install with:\n"
             "    pip install -e .[webui]"
         ) from exc
+
+
+def _extract_context_and_history(
+    messages: List[ChatMessage],
+) -> tuple[str, str, list[dict[str, str]]]:
+    """Parse an OpenWebUI message list into (context, user_text, history).
+
+    OpenWebUI prepends search results and RAG context as one or more
+    system messages at the start of the conversation.  Extracting them
+    here means agent.handle() always receives the full picture without
+    needing to understand OpenWebUI's internal message format.
+
+    Returns
+    -------
+    context_text : str
+        Concatenated content of all system/tool messages that appear
+        *before* the first user turn.  Empty string when absent.
+    user_text : str
+        Content of the *last* user message.
+    history : list[dict]
+        Prior (role, content) pairs — assistant and user turns that
+        precede the final user message — for multi-turn context.
+    """
+    # Collect leading system/tool context injected by OpenWebUI.
+    context_parts: list[str] = []
+    first_user_idx = 0
+    for i, msg in enumerate(messages):
+        if msg.role in ("system", "tool"):
+            text = msg.content if isinstance(msg.content, str) else ""
+            if text.strip():
+                context_parts.append(text.strip())
+        else:
+            first_user_idx = i
+            break
+
+    context_text = "\n\n".join(context_parts)
+
+    # Find the last user message.
+    user_text = ""
+    last_user_idx = -1
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].role == "user":
+            content = messages[i].content
+            user_text = content if isinstance(content, str) else ""
+            last_user_idx = i
+            break
+
+    # Build conversation history from turns between the first user
+    # message and the last user message (exclusive).
+    history: list[dict[str, str]] = []
+    for msg in messages[first_user_idx:last_user_idx]:
+        if msg.role in ("user", "assistant"):
+            text = msg.content if isinstance(msg.content, str) else ""
+            if text.strip():
+                history.append({"role": msg.role, "content": text.strip()})
+
+    return context_text, user_text, history
 
 
 def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
@@ -253,14 +319,22 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
         user_id: str = Depends(_get_user_id),
         agent: Agent = Depends(_get_agent),
     ) -> fastapi.Response:
-        user_text = ""
-        for m in reversed(body.messages):
-            if m.role == "user":
-                content = m.content
-                user_text = content if isinstance(content, str) else ""
-                break
+        context_text, user_text, history = _extract_context_and_history(body.messages)
+
         if not user_text:
             raise HTTPException(status_code=400, detail="No user message found.")
+
+        # When OpenWebUI injected search results or RAG context, prepend them
+        # to the prompt so the agent sees them.  Log a one-liner so it's easy
+        # to confirm search injection is working in `docker compose logs`.
+        if context_text:
+            log.info(
+                "webui: forwarding %d chars of injected context to agent",
+                len(context_text),
+            )
+            full_prompt = f"{context_text}\n\n{user_text}"
+        else:
+            full_prompt = user_text
 
         model_id = body.model or "localbot-general"
         created = int(time.time())
@@ -277,7 +351,25 @@ def create_app() -> "fastapi.FastAPI":  # type: ignore[name-defined]
 
         async def _run_agent() -> None:
             try:
-                await agent.handle(user_id, user_text, on_token=_on_token)
+                await asyncio.wait_for(
+                    agent.handle(
+                        user_id,
+                        full_prompt,
+                        on_token=_on_token,
+                        history=history or None,
+                    ),
+                    timeout=_REQUEST_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                log.error(
+                    "Agent task timed out after %ds for user %s",
+                    _REQUEST_TIMEOUT,
+                    user_id,
+                )
+                await token_queue.put(
+                    f"\n\n⚠️ Request timed out after {_REQUEST_TIMEOUT}s. "
+                    "The model may be overloaded — please try again."
+                )
             except Exception:
                 log.exception("Streaming agent task failed for user %s", user_id)
             finally:
