@@ -1,6 +1,6 @@
 # LocalBot
 
-A privacy-first, self-hosted AI assistant that runs a local LLM entirely on your own machine — no cloud API calls for inference. All conversation history, scheduled jobs, the audit log, and the model weights stay local.
+A privacy-first, self-hosted AI assistant that runs a local LLM entirely on your own machine — no cloud API calls for inference by default. All conversation history, scheduled jobs, the audit log, and the model weights stay local.
 
 The Python layer is intentionally thin: it never loads the model itself. All inference is delegated to [`llama-server`](https://github.com/ggerganov/llama.cpp) via its OpenAI-compatible HTTP API. LocalBot surfaces through two interfaces simultaneously: **Discord DMs** and a **browser UI** via [OpenWebUI](https://github.com/open-webui/open-webui).
 
@@ -16,6 +16,8 @@ The Python layer is intentionally thin: it never loads the model itself. All inf
 - **Self-diagnostics** — the LLM can call `read_logs` to reason over its own audit log conversationally
 - **Multi-slot model routing** — routes each request to a `general`, `coding`, or `reasoning` model slot based on intent
 - **Two-phase coding dispatch** — when a coding request also needs external lookup, the general model fetches context first, then the coding model implements
+- **Groq fast path** — when `GROQ_API_KEY` is set, non-sensitive queries route to Groq for sub-100 ms TTFT (~300–600 tok/s), falling back to local on error
+- **Speculative decoding** — optional draft model support via llama-server; adds ~1.5–2× effective tok/s at ~0.5 GB RAM cost
 - **Thinking model support** — auto-strips `<think>` blocks for Qwen, DeepSeek, Gemma
 - **Auto-updater** — checks for newer llama.cpp builds on startup, prompts to install
 - **Self-healing** — detects `llama-server` crashes and restarts automatically
@@ -65,15 +67,22 @@ You don't need to add it to `PATH` — point LocalBot at it directly via `LLAMA_
 
 ### 4. A GGUF model file
 
-#### Recommended models (≤16 GB RAM)
+#### Hardware-optimised model stack (i5-10400H, 16 GB DDR4, no discrete GPU)
 
-| Slot | Model | Quant | RAM |
-|---|---|---|---|
-| `general` | [Qwen3.5-7B-Instruct](https://huggingface.co/Qwen/Qwen3.5-7B-Instruct-GGUF) | Q4_K_M | ~5.5 GB |
-| `coding` | [Qwen3-Coder-7B-A2B](https://huggingface.co/Qwen/Qwen3-Coder-7B-A2B-GGUF) | Q4_K_M | ~5 GB |
-| `reasoning` | [Qwen3.5-7B-Instruct](https://huggingface.co/Qwen/Qwen3.5-7B-Instruct-GGUF) | Q5_K_M | ~5.8 GB |
+CPU-only inference on this hardware is **memory-bandwidth-bound** at ~35–38 GB/s sustained. Smaller, well-quantised models deliver dramatically better tok/s than larger ones with marginal quality loss for chat tasks.
 
-> **Tip:** `general` and `reasoning` can share the same GGUF file — only the system prompt differs, so switching between them is instant with no model reload.
+| Slot | Recommended model | Quant | RAM | Realistic tok/s |
+|---|---|---|---|---|
+| `general` | [Qwen2.5-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF) | Q4_K_M | ~1.9 GB | 12–20 |
+| `coding` | [Qwen3-Coder-4B-A1.3B](https://huggingface.co/Qwen/Qwen3-Coder-4B-A1.3B-GGUF) (MoE) | Q4_K_M | ~2.5 GB | 14–22 eff. |
+| `reasoning` | [Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF) | Q5_K_M | ~5.5 GB | 5–8 |
+| `draft` *(optional)* | [Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF) | Q4_K_M | ~0.4 GB | +1.5–2× |
+
+> **Why MoE for coding?** The Qwen3-Coder-4B-A1.3B model has 4B total parameters but only activates 1.3B per token, giving near-4B quality at the memory bandwidth cost of a ~1.3B dense model.
+
+> **Why not use the Intel UHD iGPU?** The UHD Graphics (GT2) shares system DDR4 memory. Offloading layers via Vulkan uses the same bus as the CPU and adds driver overhead, resulting in slower tok/s on this iGPU class. Keep `LLAMA_ARG_N_GPU_LAYERS=0`.
+
+> **Speculative decoding** adds ~0.4 GB for the draft model and delivers ~1.5–2× effective tok/s at 70–80% acceptance rates. Enable it by setting `SLOT_DRAFT_MODEL` and adding `--model-draft` to `LLAMA_SERVER_EXTRA_ARGS`. See [Speculative Decoding](#speculative-decoding) below.
 
 #### Higher-RAM options (24–48 GB)
 
@@ -98,8 +107,6 @@ Place your model file(s) in `C:\Llama\Models\` — this folder is mounted into t
 
 ### Option A — Docker Compose (recommended)
 
-This is the fastest path. Docker handles the Python environment, llama-server binary, and all services.
-
 #### 1. Clone the repo
 
 ```powershell
@@ -111,11 +118,6 @@ Set-Location LocalBot
 
 ```powershell
 Copy-Item .env.example .env
-```
-
-Open `.env` in your editor and fill in the required values:
-
-```powershell
 notepad .env
 ```
 
@@ -124,8 +126,11 @@ notepad .env
 | `DISCORD_BOT_TOKEN` | ✅ *(Discord mode)* | Bot token from the Developer Portal |
 | `GITHUB_TOKEN` | — | GitHub PAT for the MCP server (`repo`, `read:org`) |
 | `WEBUI_API_KEY` | ✅ *(if exposed off-loopback)* | Shared secret between OpenWebUI and the API bridge |
-| `SLOT_0_MODEL` | ✅ | Container path to your `.gguf` file (e.g. `/models/my-model-q4_k_m.gguf`) |
-| `LLAMA_CTX_SIZE` | — | Context window size. Default `4096` |
+| `SLOT_GENERAL_MODEL` | ✅ | Container path to your `.gguf` file (e.g. `/models/qwen2.5-3b-q4_k_m.gguf`) |
+| `GROQ_API_KEY` | — | Groq API key for fast cloud inference fallback |
+| `BRAVE_API_KEY` | — | Brave Search API key for web search |
+| `LLAMA_CTX_SIZE` | — | Context window size. Default `2048` |
+| `LLAMA_SERVER_EXTRA_ARGS` | — | Extra flags for llama-server; see Performance Tuning below |
 
 See [`.env.example`](.env.example) for all options with inline descriptions.
 
@@ -147,8 +152,8 @@ docker compose up -d
 ```
 
 This starts:
-- **`localbot`** — Discord bot + llama-server subprocess on the inference budget
-- **`localbot-webui`** — OpenAI-compatible FastAPI bridge on `http://localhost:8080`
+- **`localbot`** — Discord bot + llama-server subprocess
+- **`localbot-webui`** — OpenAI-compatible FastAPI bridge on `http://localhost:8090`
 - **`github-mcp-server`** — GitHub MCP server on `http://localhost:8181`
 - **`openwebui`** — Browser UI on `http://localhost:3000`
 
@@ -156,25 +161,14 @@ This starts:
 
 ```powershell
 docker compose ps
-```
-
-All four containers should show `running`. Check logs for any individual service:
-
-```powershell
 docker compose logs -f localbot
-docker compose logs -f github-mcp-server
 ```
 
 #### 6. Stopping and restarting
 
 ```powershell
-# Stop all services (preserves data)
 docker compose down
-
-# Restart a single service after a config change
 docker compose up -d --force-recreate localbot
-
-# Rebuild the image after a code change
 docker compose up -d --build localbot
 ```
 
@@ -182,84 +176,86 @@ docker compose up -d --build localbot
 
 ### Option B — Local Python (no Docker)
 
-Use this if you want to run LocalBot directly on your machine without containers.
-
-#### 1. Clone and create a virtual environment
-
 ```powershell
 git clone https://github.com/dmg10007/LocalBot.git
 Set-Location LocalBot
 python -m venv .venv
 .venv\Scripts\Activate.ps1
-```
 
-> If you get an execution policy error, run:
-> ```powershell
-> Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
-> ```
+pip install -e .           # core
+pip install -e ".[webui]"  # + OpenWebUI HTTP server
+pip install -e ".[dev]"    # + dev tools
 
-#### 2. Install dependencies
-
-```powershell
-# Core (Discord bot only)
-pip install -e .
-
-# + OpenWebUI HTTP server
-pip install -e ".[webui]"
-
-# + Dev tools (ruff, mypy, pytest)
-pip install -e ".[dev]"
-```
-
-#### 3. Configure
-
-```powershell
 Copy-Item .env.example .env
 notepad .env
-```
-
-Set at minimum:
-
-| Variable | Required | Description |
-|---|---|---|
-| `DISCORD_BOT_TOKEN` | ✅ *(Discord mode)* | Bot token from the Developer Portal |
-| `LLAMA_SERVER_MODEL_PATH` | ✅ | Absolute path to your `.gguf` model file |
-| `LLAMA_SERVER_EXECUTABLE` | ✅ | Full path to `llama-server.exe` |
-| `LLAMA_SERVER_N_GPU_LAYERS` | — | `0` = CPU (default), `-1` = all layers on GPU |
-| `BRAVE_API_KEY` | — | Leave blank to disable web search |
-| `LLAMA_SERVER_MODEL_FAMILY` | — | Leave blank for auto-detection |
-| `MODEL_TEMPERATURE` | — | Default `0.3` |
-| `BOT_OWNER_ID` | — | Your Discord user ID — grants full log access |
-| `SANDBOX_ROOT` | — | Directory the LLM may read/write. Defaults to `./sandbox` |
-| `WEBUI_API_KEY` | — | Bearer token for the HTTP API. Leave blank to disable auth |
-
-#### 4. Create required directories
-
-```powershell
 New-Item -ItemType Directory -Force -Path logs, storage, sandbox
+
+localbot          # Discord mode
+localbot-webui    # HTTP / OpenWebUI mode
 ```
 
-#### 5. Run
+---
 
-**Discord mode:**
-```powershell
-localbot
+## Performance Tuning
+
+### llama.cpp Flags (i5-10400H reference)
+
+The defaults in `docker-compose.yml` are already tuned for the i5-10400H. These are the key settings and why they are set the way they are:
+
+| Setting | Value | Rationale |
+|---|---|---|
+| `LLAMA_ARG_THREADS` | `4` | Physical cores only — token generation is memory-bandwidth-bound; HT adds contention |
+| `LLAMA_ARG_THREADS_BATCH` | `8` | All logical threads — prompt eval is more compute-bound; HT helps here |
+| `LLAMA_ARG_CTX_SIZE` | `2048` | Halves KV cache vs 4096; raise to `4096` in `.env` only if you need longer context |
+| `LLAMA_ARG_N_GPU_LAYERS` | `0` | **Do not change.** Intel UHD iGPU shares DDR4 bandwidth; Vulkan offloading is slower |
+| `LLAMA_ARG_MMAP` | `true` | Memory-map model file; fast cold start, lower RSS |
+
+The following extra args are set via `LLAMA_SERVER_EXTRA_ARGS` in `.env`:
+
+| Flag | Effect |
+|---|---|
+| `--flash-attn` | O(n) attention memory vs O(n²); cuts TTFT ~15–25% as history accumulates |
+| `--cache-type-k q8_0` | 8-bit KV key cache; frees ~200–500 MB with negligible quality delta |
+| `--cache-type-v q8_0` | 8-bit KV value cache |
+| `--ubatch-size 512` | Micro-batch size for parallel prompt evaluation |
+
+### Speculative Decoding
+
+Speculative decoding uses a small, fast draft model to generate candidate tokens that the main model verifies in a single forward pass. At 70–80% acceptance rates this delivers **~1.5–2× effective tok/s** with ~0.4 GB additional RAM.
+
+```env
+# .env
+SLOT_DRAFT_MODEL=/models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+LLAMA_SERVER_EXTRA_ARGS=--flash-attn --cache-type-k q8_0 --cache-type-v q8_0 --ubatch-size 512 --model-draft /models/qwen2.5-0.5b-instruct-q4_k_m.gguf --draft-max 5 --draft-min 1
 ```
 
-**HTTP / OpenWebUI mode:**
-```powershell
-localbot-webui
+RAM budget with speculative decoding on 16 GB:
+
+| Active slots | Total RAM |
+|---|---|
+| General 3B + 0.5B draft | ~2.3 GB |
+| Coding 4B MoE + 0.5B draft | ~3.0 GB |
+| Reasoning 7B + 0.5B draft | ~6.2 GB |
+
+### Groq Fast Path
+
+When `GROQ_API_KEY` is set, LocalBot can route eligible queries to Groq's LPU for **sub-100 ms TTFT** and **~300–600 tok/s** — roughly 40–80× faster than local CPU inference.
+
+**Privacy policy:** only non-sensitive queries are ever routed to Groq. The routing logic in `intent.py` blocks any query that involves:
+- Filesystem or GitHub workspace operations
+- Scheduler creation/cancellation
+- Diagnostic log access
+
+Everything else — general chat, search synthesis, reasoning without personal context — is eligible.
+
+```env
+# .env
+GROQ_API_KEY=gsk_your_key_here
 ```
 
-`llama-server` starts automatically as a subprocess. Its stdout/stderr (including crashes, OOM errors, CUDA failures) are captured and forwarded to the application log.
+Get a free key at [console.groq.com/keys](https://console.groq.com/keys). The free tier allows 30 req/min and 6,000 req/day on `llama-3.1-8b-instant`.
 
-If a newer llama.cpp build is available you will be prompted:
-
-```
-Install llama.cpp b9222? [y/N] (auto-skip in 30s):
-```
-
-Set `LLAMA_UPDATE_AUTO=true` in `.env` to install updates automatically.
+If Groq is unavailable or returns an error, LocalBot automatically falls back to the local model for that request.
 
 ---
 
@@ -269,21 +265,18 @@ LocalBot exposes an OpenAI-compatible API that OpenWebUI connects to. The three 
 
 ### Docker Compose (recommended)
 
-After `docker compose up -d`, OpenWebUI is available at `http://localhost:3000` — no manual connection setup needed.
+After `docker compose up -d`, OpenWebUI is available at `http://localhost:3000`.
 
 ### Standalone
 
 ```powershell
-# Terminal 1 — start the bot and inference engine
-localbot
-
-# Terminal 2 — start the API bridge
-localbot-webui
+localbot          # Terminal 1 — bot + inference engine
+localbot-webui    # Terminal 2 — API bridge
 ```
 
 Then in OpenWebUI → **Settings → Connections → OpenAI API**:
-- URL: `http://127.0.0.1:8080/v1`
-- Key: value of `WEBUI_API_KEY` (or anything if auth is off)
+- URL: `http://127.0.0.1:8090/v1`
+- Key: value of `WEBUI_API_KEY`
 
 ### Endpoints
 
@@ -325,7 +318,7 @@ When `SANDBOX_ROOT` is set, the LLM has access to six filesystem tools:
 | `search_in_files` | Grep across the workspace; supports glob filters |
 | `get_current_dir` | Return the current path relative to `SANDBOX_ROOT` |
 
-**Security:** All paths are resolved inside `SANDBOX_ROOT` before I/O. Absolute paths are re-rooted; `../` traversal raises `PermissionError`. Binary extensions are blocked on both read and write.
+**Security:** All paths are resolved inside `SANDBOX_ROOT` before I/O. Absolute paths are re-rooted; `../` traversal raises `PermissionError`. Symlinks whose targets escape the sandbox are blocked. Binary extensions are blocked on both read and write.
 
 ---
 
@@ -341,11 +334,13 @@ Every request is classified by `intent.py` before a model slot is acquired:
 
 When a coding request also requires external lookup (docs, API references, search), a **two-phase dispatch** fires: the general model fetches context, then the coding model implements using that context.
 
+When `GROQ_API_KEY` is configured and the query is non-sensitive and requires no tool calls, the **Groq fast path** fires before local model acquisition. On error it falls back to local transparently.
+
 ---
 
 ## Swapping Models
 
-Update `SLOT_0_MODEL` (or the relevant slot) in `.env` and restart:
+Update `SLOT_GENERAL_MODEL` (or the relevant slot) in `.env` and restart:
 
 ```powershell
 docker compose up -d --force-recreate localbot
@@ -373,8 +368,8 @@ LLAMA_SERVER_MODEL_FAMILY=gemma
 
 Ask conversationally:
 
-> *"Why did my 8am reminder not fire?"*
-> *"Check the logs for errors"*
+> *"Why did my 8am reminder not fire?"*  
+> *"Check the logs for errors"*  
 > *"What did you search for last time?"*
 
 The LLM calls `read_logs`, receives a filtered JSON slice of the audit log, and explains what it finds. Each user sees only their own entries by default. Set `BOT_OWNER_ID` in `.env` for full cross-user log access.
@@ -385,7 +380,7 @@ The LLM calls `read_logs`, receives a filtered JSON slice of the audit log, and 
 
 Just ask naturally:
 
-> *"Remind me every morning at 8am to review my task list"*
+> *"Remind me every morning at 8am to review my task list"*  
 > *"Send me tech news every weekday at 6pm"*
 
 The LLM translates to cron and calls `schedule_job`. The bot only confirms a job once `schedule_job` has returned successfully and always relays the real job ID — it never invents one. Jobs are validated against legal cron field ranges and per-user limits before registration.
@@ -400,27 +395,22 @@ The LLM translates to cron and calls `schedule_job`. The bot only confirms a job
 - Tool results capped at 4000 chars before context injection.
 - Scheduler job counts enforced with a single atomic DB operation to prevent TOCTOU races.
 - `read_logs` scoped to the requesting user's ID — the LLM cannot bypass this.
-- Filesystem tools confined to `SANDBOX_ROOT`; traversal blocked at OS level.
+- Filesystem tools confined to `SANDBOX_ROOT`; traversal and symlink escapes blocked at OS level.
 - HTTP API requires a Bearer token when `WEBUI_API_KEY` is set; each token maps to an isolated user namespace.
 - Config validated at startup (pydantic-settings) — invalid values fail fast with clear messages.
 - Storage paths validated against the project root at startup to prevent traversal via misconfigured env vars.
+- **Groq routing policy:** filesystem, scheduler, and diagnostic queries are never routed off-device. The eligibility check in `intent.is_groq_eligible()` is the enforcement point.
 
 ---
 
 ## Development
 
 ```powershell
-# Activate the virtual environment
 .venv\Scripts\Activate.ps1
 
-# Lint + format
 ruff check .
 ruff format .
-
-# Type check
 mypy src/
-
-# Tests
 pytest
 ```
 
@@ -434,15 +424,16 @@ The test suite uses `conftest.py` to stub `localbot.config` and optional heavy d
 src/localbot/
 ├── app.py                   # Discord client, rate limiter, on_message handler
 ├── commands.py              # Registered command handler table (jobs, timezone, clear, help…)
-├── agent.py                 # Core request/tool loop; slot acquisition; two-phase dispatch
-├── intent.py                # Intent classification (slot selection, workspace mode, needs_tools)
+├── agent.py                 # Core request/tool loop; Groq fast path; two-phase dispatch
+├── intent.py                # Intent classification (slot selection, workspace mode, Groq eligibility)
 ├── prompts.py               # System prompts for each model slot
 ├── webui.py                 # FastAPI OpenAI-compatible API layer for OpenWebUI
 ├── config.py                # pydantic-settings config; validated at import time
 ├── messaging.py             # Discord 2000-char message splitter
 ├── adapters/
-│   ├── llamacpp_server.py       # llama-server subprocess lifecycle + log pipe
+│   ├── llamacpp_server.py       # llama-server subprocess lifecycle + speculative decoding args
 │   ├── llamacpp_client.py       # HTTP client; model family detection; think-strip
+│   ├── groq_client.py           # Groq LPU fast-path client (optional)
 │   ├── model_registry.py        # Multi-slot manager; idle unload; hot-swap
 │   ├── llamacpp_updater.py      # Startup update check (GitHub Releases API)
 │   └── llamacpp_downloader.py   # Asset selection, streaming download, zip extraction

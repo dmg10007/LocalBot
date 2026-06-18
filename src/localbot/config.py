@@ -69,12 +69,29 @@ class Config(BaseSettings):
     llama_update_auto: bool = False
     llama_update_prompt_timeout_seconds: int = 30
 
+    # ── Groq API (optional fast-path cloud inference) ────────────────────────
+    # When set, non-sensitive queries may be routed to Groq for sub-100 ms TTFT.
+    # See intent.is_groq_eligible() for the routing policy.
+    groq_api_key: str = ""
+    groq_model: str = "llama-3.1-8b-instant"
+
+    # ── Cloudflare Workers AI (optional search summarisation) ────────────────
+    cloudflare_account_id: str = ""
+    cloudflare_api_token: str = ""
+
     # ── Brave Search ─────────────────────────────────────────────────────────
     brave_api_key: str = ""
-    search_result_count: int = 5
-    search_fetch_count: int = 3
-    search_fetch_chars: int = 1500
+    search_result_count: int = 8
+    search_fetch_count: int = 5
+    search_fetch_chars: int = 2000
     search_fetch_timeout_seconds: int = 8
+
+    # ── Speculative decoding ─────────────────────────────────────────────────
+    # Path to a small draft model (0.5B–1B Q4_K_M).  When non-empty this is
+    # appended to LLAMA_SERVER_EXTRA_ARGS as --model-draft.  Leave blank to
+    # disable.  Set draft_max to tune the speculation window.
+    slot_draft_model: str = ""
+    slot_draft_max: int = 5
 
     # ── Inference knobs ──────────────────────────────────────────────────────
     model_timeout_seconds: int = 120
