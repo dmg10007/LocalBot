@@ -146,6 +146,12 @@ services:
       ENABLE_OLLAMA_API: "false"
       # Reduce OpenWebUI background worker threads — it defaults to 8
       UVICORN_WORKERS: "1"
+      # Disable automatic web search — Open WebUI v0.9.6 has a bug in
+      # chat_web_search_handler (middleware.py:1536) where it tries to subscript
+      # a StreamingResponse as a dict, causing a TypeError on every chat request
+      # that triggers web search. Disabling at the env level is cleaner than
+      # patching the upstream image.
+      ENABLE_RAG_WEB_SEARCH: "false"
     volumes:
       - openwebui-data:/app/backend/data
     depends_on:
