@@ -15,6 +15,9 @@ Changes vs original
 * chat() accepts an optional on_token callback; when provided it switches to
   stream:true against llama-server and forwards each content delta live.
   The non-streaming path is completely unchanged.
+* ModelSwappedError is raised when the underlying aiohttp session is
+  disconnected mid-request because the idle timer swapped the active slot.
+  Callers can catch this sentinel and retry with a fresh client.
 """
 from __future__ import annotations
 
@@ -36,6 +39,13 @@ log = logging.getLogger(__name__)
 
 # Type alias for the streaming token callback.
 TokenCallback = Callable[[str], Awaitable[None]]
+
+
+class ModelSwappedError(RuntimeError):
+    """Raised when the llama-server was swapped out while a request was
+    in-flight.  The caller should re-acquire a fresh client from the
+    ModelRegistry and retry the request once.
+    """
 
 
 class ModelFamily(Enum):
@@ -192,6 +202,10 @@ class LlamaCppClient:
         return value is a synthetic non-streaming response dict so callers
         (e.g. the tool loop) can be written once and work for both paths.
 
+        Raises ModelSwappedError when the server disconnects because the
+        idle timer swapped the active slot.  Callers should re-acquire a
+        fresh client and retry once.
+
         Raises RuntimeError on non-2xx HTTP responses so callers receive a
         clear error instead of an aiohttp.ClientResponseError with raw bytes.
         """
@@ -228,6 +242,17 @@ class LlamaCppClient:
                 json=payload,
                 timeout=aiohttp.ClientTimeout(total=cfg.model_timeout_seconds),
             )
+        except aiohttp.ServerDisconnectedError as exc:
+            # The idle timer closed the server while this request was
+            # connecting.  Surface as ModelSwappedError so callers can
+            # re-acquire a fresh client and retry.
+            log.warning(
+                "[client] server disconnected during POST — model was likely "
+                "swapped by the idle timer: %s", exc
+            )
+            raise ModelSwappedError(
+                "llama-server disconnected mid-request (model swap)"
+            ) from exc
         except aiohttp.ClientError as exc:
             raise RuntimeError(f"llama-server request failed: {exc}") from exc
 
@@ -245,40 +270,51 @@ class LlamaCppClient:
             tool_calls: list[dict[str, Any]] = []
             finish_reason: str | None = None
 
-            async for raw_line in resp.content:
-                line = raw_line.decode("utf-8").strip()
-                if not line or not line.startswith("data:"):
-                    continue
-                data_str = line[len("data:"):].strip()
-                if data_str == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data_str)
-                except json.JSONDecodeError:
-                    continue
+            try:
+                async for raw_line in resp.content:
+                    line = raw_line.decode("utf-8").strip()
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data_str = line[len("data:"):].strip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
 
-                choice = (chunk.get("choices") or [{}])[0]
-                delta = choice.get("delta", {})
-                finish_reason = choice.get("finish_reason") or finish_reason
+                    choice = (chunk.get("choices") or [{}])[0]
+                    delta = choice.get("delta", {})
+                    finish_reason = choice.get("finish_reason") or finish_reason
 
-                # Accumulate tool_calls deltas (index-keyed)
-                for tc_delta in delta.get("tool_calls") or []:
-                    idx = tc_delta.get("index", 0)
-                    while len(tool_calls) <= idx:
-                        tool_calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
-                    if tc_delta.get("id"):
-                        tool_calls[idx]["id"] = tc_delta["id"]
-                    fn = tc_delta.get("function", {})
-                    if fn.get("name"):
-                        tool_calls[idx]["function"]["name"] += fn["name"]
-                    if fn.get("arguments"):
-                        tool_calls[idx]["function"]["arguments"] += fn["arguments"]
+                    # Accumulate tool_calls deltas (index-keyed)
+                    for tc_delta in delta.get("tool_calls") or []:
+                        idx = tc_delta.get("index", 0)
+                        while len(tool_calls) <= idx:
+                            tool_calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                        if tc_delta.get("id"):
+                            tool_calls[idx]["id"] = tc_delta["id"]
+                        fn = tc_delta.get("function", {})
+                        if fn.get("name"):
+                            tool_calls[idx]["function"]["name"] += fn["name"]
+                        if fn.get("arguments"):
+                            tool_calls[idx]["function"]["arguments"] += fn["arguments"]
 
-                # Forward content token to caller
-                token = delta.get("content") or ""
-                if token:
-                    full_content += token
-                    await on_token(token)  # type: ignore[misc]
+                    # Forward content token to caller
+                    token = delta.get("content") or ""
+                    if token:
+                        full_content += token
+                        await on_token(token)  # type: ignore[misc]
+
+            except aiohttp.ServerDisconnectedError as exc:
+                # Disconnected mid-stream — same swap race as above.
+                log.warning(
+                    "[client] server disconnected during SSE stream — model was "
+                    "likely swapped by the idle timer: %s", exc
+                )
+                raise ModelSwappedError(
+                    "llama-server disconnected mid-stream (model swap)"
+                ) from exc
 
             # Strip thinking blocks from the accumulated content
             is_thinking = self._family in _THINKING_FAMILIES

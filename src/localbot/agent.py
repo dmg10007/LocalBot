@@ -16,6 +16,10 @@ Design goals after refactor
 * Groq fast path: when GROQ_API_KEY is set and the query is eligible
   (no filesystem/scheduler/diagnostics context), the request is routed
   to Groq for sub-100 ms TTFT.  Falls back to the local model on error.
+* ModelSwappedError retry: if the idle timer swaps the active slot while
+  a request is in-flight, _run_local and _run_two_phase catch
+  ModelSwappedError, re-acquire a fresh client, and retry once.  A second
+  ModelSwappedError propagates normally to avoid infinite loops.
 """
 from __future__ import annotations
 
@@ -25,6 +29,7 @@ import logging
 from typing import Any, Awaitable, Callable, TYPE_CHECKING
 
 from localbot.adapters.groq_client import GroqClient
+from localbot.adapters.llamacpp_client import ModelSwappedError
 from localbot.adapters.model_registry import ModelRegistry, SlotName
 from localbot.config import cfg
 from localbot.intent import (
@@ -162,7 +167,12 @@ class Agent:
         sched_tools: Any,
         on_token: TokenCallback | None = None,
     ) -> str:
-        """Acquire the appropriate local model slot and run the agent loop."""
+        """Acquire the appropriate local model slot and run the agent loop.
+
+        If the idle timer swaps the slot while the request is in-flight,
+        ModelSwappedError is caught, a fresh client is acquired, and the
+        loop retries once.  A second ModelSwappedError propagates normally.
+        """
         client = await self._registry.acquire(slot)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt_for_slot(slot)},
@@ -177,11 +187,23 @@ class Agent:
             if needs_tools(user_message, history, sched_tools is not None, workspace_mode)
             else None
         )
-        return await self._run_loop(
-            client, messages, tools, sched_tools,
-            requesting_user_id=user_id,
-            on_token=on_token,
-        )
+        try:
+            return await self._run_loop(
+                client, messages, tools, sched_tools,
+                requesting_user_id=user_id,
+                on_token=on_token,
+            )
+        except ModelSwappedError:
+            log.warning(
+                "[agent] model was swapped mid-request for slot '%s' — "
+                "re-acquiring and retrying once", slot
+            )
+            client = await self._registry.acquire(slot)
+            return await self._run_loop(
+                client, messages, tools, sched_tools,
+                requesting_user_id=user_id,
+                on_token=on_token,
+            )
 
     # ------------------------------------------------------------------
     # Two-phase: general model fetches context, coding model implements
@@ -205,11 +227,23 @@ class Agent:
         search_tools = build_tool_schemas(include_scheduler=False, workspace_mode=None)
         # Phase 1 (context gathering) is always non-streaming — tool calls
         # require complete JSON responses.
-        context = await self._run_loop(
-            general_client, phase1_messages, search_tools, sched_tools,
-            requesting_user_id=user_id,
-            on_token=None,
-        )
+        try:
+            context = await self._run_loop(
+                general_client, phase1_messages, search_tools, sched_tools,
+                requesting_user_id=user_id,
+                on_token=None,
+            )
+        except ModelSwappedError:
+            log.warning(
+                "[agent] model swapped during two-phase phase-1 — "
+                "re-acquiring general slot and retrying once"
+            )
+            general_client = await self._registry.acquire("general")
+            context = await self._run_loop(
+                general_client, phase1_messages, search_tools, sched_tools,
+                requesting_user_id=user_id,
+                on_token=None,
+            )
         log.debug("[agent] two-phase phase-1 context: %d chars", len(context))
 
         coding_client = await self._registry.acquire("coding")
@@ -225,11 +259,23 @@ class Agent:
         ]
         coding_tools = build_tool_schemas(include_scheduler=False, workspace_mode=workspace_mode)
         # Phase 2 (implementation) streams to the caller.
-        return await self._run_loop(
-            coding_client, phase2_messages, coding_tools, None,
-            requesting_user_id=user_id,
-            on_token=on_token,
-        )
+        try:
+            return await self._run_loop(
+                coding_client, phase2_messages, coding_tools, None,
+                requesting_user_id=user_id,
+                on_token=on_token,
+            )
+        except ModelSwappedError:
+            log.warning(
+                "[agent] model swapped during two-phase phase-2 — "
+                "re-acquiring coding slot and retrying once"
+            )
+            coding_client = await self._registry.acquire("coding")
+            return await self._run_loop(
+                coding_client, phase2_messages, coding_tools, None,
+                requesting_user_id=user_id,
+                on_token=on_token,
+            )
 
     # ------------------------------------------------------------------
     # Core agentic loop
@@ -256,6 +302,9 @@ class Agent:
         from calling the same tool with the same arguments twice in one turn.
         Iteration cap: when max_tool_iterations is reached, we force a final
         synthesis message so the user always gets a response.
+
+        ModelSwappedError is NOT caught here — it propagates up to
+        _run_local / _run_two_phase which hold the retry logic.
         """
         called: set[tuple[str, str]] = set()
 
