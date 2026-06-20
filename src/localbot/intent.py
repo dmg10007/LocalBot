@@ -83,6 +83,36 @@ _GITHUB_WORKSPACE = re.compile(
     re.IGNORECASE,
 )
 
+# ---------------------------------------------------------------------------
+# Tool name sets — used to decide which queries can be routed to Groq
+# ---------------------------------------------------------------------------
+
+# Tools that are safe to call from Groq (no private user data).
+PUBLIC_TOOL_NAMES: frozenset[str] = frozenset({
+    "web_search",
+    "reddit_search",
+    "get_current_time",
+})
+
+# Tools that must stay on the local model (private data or side-effects).
+PRIVATE_TOOL_NAMES: frozenset[str] = frozenset({
+    "read_logs",
+    "schedule_job",
+    "cancel_job",
+    "list_jobs",
+    "read_file",
+    "write_file",
+    "list_directory",
+    "apply_patch",
+    "search_in_files",
+    "github_read_file",
+    "github_list_directory",
+    "github_create_branch",
+    "github_commit_files",
+    "github_create_pull_request",
+    "github_list_pull_requests",
+})
+
 
 # ---------------------------------------------------------------------------
 # Public helpers
@@ -112,16 +142,19 @@ def detect_workspace_mode(message: str) -> WorkspaceMode:
     return None
 
 
-def needs_tools(
+def needs_private_tools(
     message: str,
     history: list[dict[str, Any]],
     has_scheduler: bool = False,
     workspace_mode: WorkspaceMode = None,
 ) -> bool:
-    """Return True if this turn should receive tool schemas."""
+    """Return True when this turn requires tools that access private user data.
+
+    Private tools (filesystem, scheduler, logs, GitHub) must always run on
+    the local model.  Queries that return True here are never eligible for
+    the Groq fast path.
+    """
     stripped = message.strip()
-    if _SEARCH_INTENT.search(stripped):
-        return True
     if _DIAGNOSTIC_INTENT.search(stripped):
         return True
     if workspace_mode is not None:
@@ -130,20 +163,59 @@ def needs_tools(
         _SCHEDULE_INTENT.search(stripped) or _CANCEL_INTENT.search(stripped)
     ):
         return True
-    # Carry-over: if the most recent assistant turn referenced search/scheduling,
-    # assume the follow-up still needs tools.
+    # Carry-over: if the most recent assistant turn referenced private tools,
+    # assume the follow-up still needs them.
     for turn in reversed(history[-4:]):
         if turn.get("role") == "assistant":
             content = turn.get("content") or ""
-            if _SEARCH_INTENT.search(content):
-                return True
             if has_scheduler and (
                 _SCHEDULE_INTENT.search(content) or _CANCEL_INTENT.search(content)
             ):
                 return True
             break
+    return False
+
+
+def needs_public_tools(
+    message: str,
+    history: list[dict[str, Any]],
+) -> bool:
+    """Return True when this turn needs only public (Groq-safe) tools.
+
+    Public tools — web_search, reddit_search, get_current_time — carry no
+    private user data and can be executed via Groq function calling.
+    """
+    stripped = message.strip()
+    if _SEARCH_INTENT.search(stripped):
+        return True
+    # Carry-over: if the most recent assistant turn called a search tool,
+    # assume the follow-up still needs it.
+    for turn in reversed(history[-4:]):
+        if turn.get("role") == "assistant":
+            content = turn.get("content") or ""
+            if _SEARCH_INTENT.search(content):
+                return True
+            break
+    return False
+
+
+def needs_tools(
+    message: str,
+    history: list[dict[str, Any]],
+    has_scheduler: bool = False,
+    workspace_mode: WorkspaceMode = None,
+) -> bool:
+    """Return True if this turn should receive any tool schemas.
+
+    Thin wrapper kept for backward compatibility.  New code should call
+    needs_private_tools() / needs_public_tools() directly.
+    """
+    if needs_private_tools(message, history, has_scheduler, workspace_mode):
+        return True
+    if needs_public_tools(message, history):
+        return True
     # Conversational one-liners don't need tools.
-    return not bool(_CONVERSATIONAL.fullmatch(stripped))
+    return not bool(_CONVERSATIONAL.fullmatch(message.strip()))
 
 
 def is_system_echo(content: str) -> bool:
@@ -164,17 +236,24 @@ def is_coding_with_lookup(message: str) -> bool:
     )
 
 
-def is_groq_eligible(message: str, workspace_mode: WorkspaceMode) -> bool:
-    """Return True when a query is safe to route to Groq for speed.
+def is_groq_eligible(
+    message: str,
+    workspace_mode: WorkspaceMode,
+    has_private_tools: bool = False,
+) -> bool:
+    """Return True when a query is safe to route to Groq.
 
     Routing policy — never send to Groq when:
     - Filesystem or GitHub workspace context is involved (private files/repos)
     - Scheduler intent detected (user schedule data)
     - Diagnostic intent detected (private audit log context)
+    - The caller has already determined private tools are needed
 
     Everything else — general chat, search, reasoning without personal
-    context — is eligible for the Groq fast path.
+    context, public tool calls — is eligible for the Groq fast path.
     """
+    if has_private_tools:
+        return False
     if workspace_mode is not None:
         return False
     if _SCHEDULE_INTENT.search(message) or _CANCEL_INTENT.search(message):
