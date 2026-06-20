@@ -70,10 +70,13 @@ class Config(BaseSettings):
     llama_update_prompt_timeout_seconds: int = 30
 
     # ── Groq API (optional fast-path cloud inference) ────────────────────────
-    # When set, non-sensitive queries may be routed to Groq for sub-100 ms TTFT.
-    # See intent.is_groq_eligible() for the routing policy.
+    # When set, non-sensitive queries are routed to Groq for sub-100 ms TTFT.
+    # groq_model       — used for general / coding slot queries (fast, small).
+    # groq_model_heavy — used for reasoning slot queries (larger, more capable).
+    # See intent.is_groq_eligible() for the full routing policy.
     groq_api_key: str = ""
     groq_model: str = "llama-3.1-8b-instant"
+    groq_model_heavy: str = "llama-3.3-70b-versatile"
 
     # ── Cloudflare Workers AI (optional search summarisation) ────────────────
     cloudflare_account_id: str = ""
