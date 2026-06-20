@@ -32,19 +32,31 @@ class GroqClient:
 
     Instantiated once in Agent when GROQ_API_KEY is configured; reused across
     requests.  The session is closed via close() on bot shutdown.
+
+    The aiohttp session is created lazily on first use rather than in
+    __init__.  Agent.__init__ runs inside LocalBot.__init__, which executes
+    in main() *before* bot.run() starts the asyncio event loop — so
+    aiohttp.ClientSession() in __init__ would raise "no running event loop".
+    This mirrors the lazy _get_session() pattern already used in
+    tools/search.py and tools/reddit.py.
     """
 
     def __init__(self, api_key: str, model: str = _DEFAULT_MODEL) -> None:
         self._api_key = api_key
         self._model = model
-        self._session: aiohttp.ClientSession = aiohttp.ClientSession()
+        self._session: aiohttp.ClientSession | None = None
 
     @property
     def model(self) -> str:
         return self._model
 
+    def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
     async def close(self) -> None:
-        if not self._session.closed:
+        if self._session is not None and not self._session.closed:
             await self._session.close()
 
     async def chat(
@@ -76,8 +88,9 @@ class GroqClient:
             "Content-Type": "application/json",
         }
 
+        session = self._get_session()
         try:
-            resp = await self._session.post(
+            resp = await session.post(
                 _GROQ_URL,
                 json=payload,
                 headers=headers,

@@ -26,8 +26,11 @@
 #   - LLAMA_ARG_MMAP=true            → memory-map model file; fast cold start, lower RSS
 #
 # Extra args passed via LLAMA_SERVER_EXTRA_ARGS (set in .env or override here):
-#   --flash-attn                     → O(n) attention memory vs O(n²); cuts TTFT ~15-25% for
-#                                       accumulated history; required for ctx > 2048
+#   --flash-attn on                  → O(n) attention memory vs O(n²); cuts TTFT ~15-25% for
+#                                       accumulated history; required for ctx > 2048.
+#                                       NOTE: must pass an explicit value (on/off/auto) on
+#                                       llama.cpp builds b9xxx+ — bare --flash-attn will fail
+#                                       to parse and crash llama-server on startup.
 #   --cache-type-k q8_0              → 8-bit KV key cache; frees ~200-500 MB RAM vs fp16
 #   --cache-type-v q8_0              → 8-bit KV value cache; negligible quality delta
 #   --ubatch-size 512                → micro-batch for parallel prompt evaluation

@@ -1,0 +1,186 @@
+From b679136ea023e9be4e0b99e445c03577c94d1621 Mon Sep 17 00:00:00 2001
+From: Claude <localbot-claude@users.noreply.github.com>
+Date: Wed, 17 Jun 2026 21:06:17 +0000
+Subject: [PATCH] fix: speculative decoding flags renamed in llama.cpp b9xxx+;
+ MoE caveat
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Real error from logs:
+    error while handling argument "--draft-max": the argument has
+    been removed. use --spec-draft-n-max or --spec-ngram-mod-n-max
+
+llama.cpp restructured speculative-decoding flags:
+- --draft-max / --draft-min removed entirely
+- Replaced by --spec-draft-n-max / --spec-draft-n-min
+- --spec-type now defaults to 'none' — passing --model-draft alone no
+  longer implicitly enables speculative decoding; --spec-type
+  draft-simple must be passed explicitly for draft-model-based decoding
+  (--model-draft itself is still a valid alias for --spec-draft-model)
+
+src/localbot/adapters/llamacpp_server.py
+- Append --spec-type draft-simple --model-draft --spec-draft-n-max
+  --spec-draft-n-min instead of the removed --draft-max/--draft-min
+
+src/localbot/config.py
+- Fix stale comment claiming draft args were appended to
+  LLAMA_SERVER_EXTRA_ARGS (they're appended programmatically by
+  llamacpp_server.py, a separate mechanism — doc-only fix, no behavior
+  change, but the stale comment could mislead someone into manually
+  duplicating the flag)
+- Add MoE caveat to the field docstring
+
+.env.example
+- Fixed a real conflict: the speculative-decoding comment told users
+  to manually add --model-draft to LLAMA_SERVER_EXTRA_ARGS, which
+  would have duplicated the flag llamacpp_server.py already appends
+  from SLOT_DRAFT_MODEL automatically. Removed that instruction;
+  SLOT_DRAFT_MODEL alone is now correctly documented as sufficient.
+- Added MoE net-negative caveat (see README change below)
+
+README.md
+- Speculative Decoding section: corrected flag names, removed the
+  duplicate --model-draft instruction, removed 'Coding 4B MoE + draft'
+  from the RAM budget table
+- Added caveat: independent benchmarks (19-config sweep on
+  Qwen3.6-35B-A3B, separate community testing on Gemma-4 MoE) show
+  draft-model speculative decoding is frequently net-negative on MoE
+  models — drafted tokens still trigger fresh expert-weight loads
+  during verification, eating the bandwidth savings. Recommend
+  enabling only for the dense general/reasoning slots, benchmarking
+  before relying on it for the MoE coding slot.
+---
+ .env.example                             | 17 ++++++++++++-----
+ README.md                                | 13 ++++++++-----
+ src/localbot/adapters/llamacpp_server.py |  9 +++++++--
+ src/localbot/config.py                   | 10 +++++++---
+ 4 files changed, 34 insertions(+), 15 deletions(-)
+
+diff --git a/.env.example b/.env.example
+index 8410bcf..4579d9a 100644
+--- a/.env.example
++++ b/.env.example
+@@ -64,13 +64,20 @@ SLOT_GENERAL_MODEL=/models/your-general-model-q4_k_m.gguf
+ # SLOT_REASONING_MODEL=/models/your-reasoning-model-q4_k_m.gguf
+ # SLOT_REASONING_PORT=8082                    # default: 8082
+ 
+-# ── Speculative decoding (optional — adds ~1.5-2× effective tok/s) ────────────
++# ── Speculative decoding (optional — adds ~1.5-2× effective tok/s on DENSE models) ─
+ # A small draft model generates tokens speculatively; the main model verifies
+-# them in a single pass. 70-80% acceptance rate typical → ~1.6-1.8× speedup.
++# them in a single pass. 70-80% acceptance rate typical → ~1.6-1.8× speedup
++# on dense models (SLOT_GENERAL_MODEL, SLOT_REASONING_MODEL).
++# CAVEAT: benchmarks show this is often NET NEGATIVE on MoE models (e.g. the
++# recommended SLOT_CODING_MODEL above) — drafted tokens still require loading
++# fresh expert-weight slices, eating the bandwidth savings. Benchmark before
++# relying on it for the coding slot; it's safest enabled on general/reasoning only.
+ # RAM cost: ~0.5-0.7 GB for a 0.5B-1B Q4_K_M draft model.
+ # Recommended: Qwen2.5-0.5B-Instruct Q4_K_M (~0.4 GB)
+ #              SmolLM2-1.7B-Instruct Q4_K_M  (~1.1 GB, higher acceptance rate)
+-# Set via LLAMA_SERVER_EXTRA_ARGS below.
++# Setting this alone is sufficient — llamacpp_server.py automatically appends
++# the --spec-type/--model-draft/--spec-draft-n-max flags. Do NOT also add
++# --model-draft to LLAMA_SERVER_EXTRA_ARGS below; that would pass it twice.
+ # SLOT_DRAFT_MODEL=/models/your-draft-model-q4_k_m.gguf
+ 
+ # ── llama-server tuning ───────────────────────────────────────────────────────
+@@ -81,8 +88,8 @@ LLAMA_CTX_SIZE=2048
+ 
+ # Extra args forwarded verbatim to llama-server. The defaults below are tuned
+ # for the i5-10400H and are applied by docker-compose.yml.
+-# To enable speculative decoding, add:
+-#   --model-draft /models/your-draft-model-q4_k_m.gguf --draft-max 5 --draft-min 1
++# To enable speculative decoding, set SLOT_DRAFT_MODEL above instead — do not
++# add --model-draft/--spec-type here, it would duplicate the auto-appended flags.
+ LLAMA_SERVER_EXTRA_ARGS=--flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ubatch-size 512
+ 
+ # ── Sandbox ───────────────────────────────────────────────────────────────────
+diff --git a/README.md b/README.md
+index 67b7c29..7896052 100644
+--- a/README.md
++++ b/README.md
+@@ -82,7 +82,7 @@ CPU-only inference on this hardware is **memory-bandwidth-bound** at ~35–38 GB
+ 
+ > **Why not use the Intel UHD iGPU?** The UHD Graphics (GT2) shares system DDR4 memory. Offloading layers via Vulkan uses the same bus as the CPU and adds driver overhead, resulting in slower tok/s on this iGPU class. Keep `LLAMA_ARG_N_GPU_LAYERS=0`.
+ 
+-> **Speculative decoding** adds ~0.4 GB for the draft model and delivers ~1.5–2× effective tok/s at 70–80% acceptance rates. Enable it by setting `SLOT_DRAFT_MODEL` and adding `--model-draft` to `LLAMA_SERVER_EXTRA_ARGS`. See [Speculative Decoding](#speculative-decoding) below.
++> **Speculative decoding** adds ~0.4 GB for the draft model and delivers ~1.5–2× effective tok/s at 70–80% acceptance rates **on dense models** — independent benchmarks show it's often net-negative on MoE models, so it's best applied to `general`/`reasoning` rather than the MoE `coding` slot above. Enable by setting `SLOT_DRAFT_MODEL` only (the required llama-server flags are appended automatically). See [Speculative Decoding](#speculative-decoding) below.
+ 
+ #### Higher-RAM options (24–48 GB)
+ 
+@@ -221,20 +221,23 @@ The following extra args are set via `LLAMA_SERVER_EXTRA_ARGS` in `.env`:
+ 
+ ### Speculative Decoding
+ 
+-Speculative decoding uses a small, fast draft model to generate candidate tokens that the main model verifies in a single forward pass. At 70–80% acceptance rates this delivers **~1.5–2× effective tok/s** with ~0.4 GB additional RAM.
++Speculative decoding uses a small, fast draft model to generate candidate tokens that the main model verifies in a single forward pass. At 70–80% acceptance rates this delivers **~1.5–2× effective tok/s** with ~0.4 GB additional RAM — **on dense models**.
++
++> **Caveat:** independent benchmarks show draft-model speculative decoding is often **net-negative on MoE models** (such as the Qwen3-Coder-4B-A1.3B recommended for the coding slot above). Drafted tokens still trigger fresh expert-weight loads during verification, eating the bandwidth savings the technique is meant to provide. Enable it for `general`/`reasoning` (both dense); benchmark before relying on it for `coding`.
++
++Set only `SLOT_DRAFT_MODEL` — `llamacpp_server.py` automatically appends the required `--spec-type draft-simple --model-draft --spec-draft-n-max` flags. Do **not** also add `--model-draft` to `LLAMA_SERVER_EXTRA_ARGS`; that duplicates the flag and llama-server will reject it.
+ 
+ ```env
+ # .env
+ SLOT_DRAFT_MODEL=/models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+-LLAMA_SERVER_EXTRA_ARGS=--flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ubatch-size 512 --model-draft /models/qwen2.5-0.5b-instruct-q4_k_m.gguf --draft-max 5 --draft-min 1
++LLAMA_SERVER_EXTRA_ARGS=--flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ubatch-size 512
+ ```
+ 
+-RAM budget with speculative decoding on 16 GB:
++RAM budget with speculative decoding on 16 GB (dense slots only):
+ 
+ | Active slots | Total RAM |
+ |---|---|
+ | General 3B + 0.5B draft | ~2.3 GB |
+-| Coding 4B MoE + 0.5B draft | ~3.0 GB |
+ | Reasoning 7B + 0.5B draft | ~6.2 GB |
+ 
+ ### Groq Fast Path
+diff --git a/src/localbot/adapters/llamacpp_server.py b/src/localbot/adapters/llamacpp_server.py
+index 6344f04..ef6eaac 100644
+--- a/src/localbot/adapters/llamacpp_server.py
++++ b/src/localbot/adapters/llamacpp_server.py
+@@ -40,11 +40,16 @@ class LlamaCppServer:
+         if cfg.llama_server_extra_args:
+             cmd += shlex.split(cfg.llama_server_extra_args)
+         # Speculative decoding: append draft model args when configured.
++        # --draft-max/--draft-min were removed from llama-server (b9xxx+);
++        # replaced by --spec-draft-n-max/--spec-draft-n-min. --spec-type now
++        # defaults to "none" — passing --model-draft alone no longer implicitly
++        # enables speculative decoding, so --spec-type draft-simple is required.
+         if cfg.slot_draft_model:
+             cmd += [
++                "--spec-type", "draft-simple",
+                 "--model-draft", cfg.slot_draft_model,
+-                "--draft-max", str(cfg.slot_draft_max),
+-                "--draft-min", "1",
++                "--spec-draft-n-max", str(cfg.slot_draft_max),
++                "--spec-draft-n-min", "1",
+             ]
+             log.info("Speculative decoding enabled with draft model: %s", cfg.slot_draft_model)
+ 
+diff --git a/src/localbot/config.py b/src/localbot/config.py
+index b901b30..b2084c9 100644
+--- a/src/localbot/config.py
++++ b/src/localbot/config.py
+@@ -87,9 +87,13 @@ class Config(BaseSettings):
+     search_fetch_timeout_seconds: int = 8
+ 
+     # ── Speculative decoding ─────────────────────────────────────────────────
+-    # Path to a small draft model (0.5B–1B Q4_K_M).  When non-empty this is
+-    # appended to LLAMA_SERVER_EXTRA_ARGS as --model-draft.  Leave blank to
+-    # disable.  Set draft_max to tune the speculation window.
++    # Path to a small draft model (0.5B-1B Q4_K_M).  When non-empty,
++    # llamacpp_server.py automatically appends --spec-type draft-simple,
++    # --model-draft, and --spec-draft-n-max to the llama-server command line.
++    # Leave blank to disable.  Do not also pass --model-draft via
++    # llama_server_extra_args — that would duplicate the flag.
++    # Caveat: benchmarks show this is often net-negative on MoE models;
++    # prefer it for dense general/reasoning slots over MoE coding slots.
+     slot_draft_model: str = ""
+     slot_draft_max: int = 5
+ 
+-- 
+2.43.0
+
